@@ -1,0 +1,11244 @@
+// ==UserScript==
+// @name         知到/智慧树刷课助手（顺序播放外观 + GitHub 逻辑）
+// @namespace    local.zhidao.sequential
+// @version      1.2.0
+// @description  知到（智慧树）自动播放 + 断点续播 + 顺序刷课：逻辑取自 GitHub 项目 huanweide/zhihuishu-helper（MIT），控制面板换成「顺序播放」深色小面板，不接 AI、不碰作业/考试。
+// @author       逻辑：ReTri（huanweide/zhihuishu-helper）；外观整合：本地
+// @match        *://*.zhihuishu.com/*
+// @match        *://zhihuishu.com/*
+// @match        *://*.polymas.com/*
+// @match        *://polymas.com/*
+// @match        *://*.zhihuishu.cn/*
+// @match        *://zhihuishu.cn/*
+// @icon         data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_xmlhttpRequest
+// @run-at       document-idle
+// @license      MIT
+// ==/UserScript==
+
+// 来源说明：
+//   引擎逻辑（页面适配、目录识别、播放保活、断点续播、弹题守卫、导航）来自
+//   https://github.com/huanweide/zhihuishu-helper （MIT），未改动其判断流程；
+//   仅替换了 06-panel.js 这一层界面，并调整了默认配置：
+//     speed=1（原速）、不接题库/LLM（不联网）、不自动选课、不碰作业考试。
+
+
+(function () {
+'use strict';
+
+/* ===== 构建注入 ===== */
+window.__ZHS_BUILD__ = window.__ZHS_BUILD__ || {};
+window.__ZHS_BUILD__.version = "1.2.0";
+
+/* ===== 00-config.js ===== */
+/**
+ * 智慧树网课助手 —— 全局配置与共享状态
+ *
+ * 所有模块共享一个 ZHS 命名空间对象，避免污染页面全局。
+ */
+(function () {
+  'use strict';
+
+  // 重入守卫：同一页面只跑一个实例，避免定时器/监听器叠加。
+  //
+  // 【2026-09-19 修正】原来这里是**无声** return。用户反馈「装了 27 次都没用、面板都没有」：
+  // 若油猴里残留了多份副本（反复导入很容易留下），第一份跑起来就上锁，
+  // 之后装的新版本全部静默退出 —— 谁先跑谁生效，跟版本号无关，用户完全看不到发生了什么。
+  // 现在仍然只跑一个实例（这是对的），但要把「为什么没生效」在控制台说清楚。
+  if (window.__ZHS_HELPER__) {
+    try {
+      const prev = window.__ZHS_HELPER_VERSION__;
+      console.warn('[智慧树助手] 检测到页面已有脚本实例'
+        + (prev ? '（版本 ' + prev + '）' : '')
+        + '，本次注入已退出。若你重复安装了多份，请在油猴里删掉多余副本，只保留一份。');
+    } catch (e) { /* 连控制台都不可用时，绝不能因此中断脚本 */ }
+    return;
+  }
+
+  // ============ 默认配置 ============
+  const DEFAULTS = {
+    // F1 自动播放
+    autoPlay: true,
+    autoNext: true,
+    skipFinished: true,  // 自动跳过已完成/未解锁节点
+    speed: 1,            // 默认原速（平台上限 1.5；再高更容易被风控盯上）
+    mute: true,          // 静音
+    nextDelayMin: 2,     // 切课随机延迟下限（秒），模拟人类
+    nextDelayMax: 8,     // 切课随机延迟上限（秒）
+
+    // 拟人化随机暂停（round-45，依据 pjm314159/zhs 官方客户端的播放循环行为）:
+    //   官方客户端每轮播放循环有 0.25% 概率随机暂停 60 秒 —— 真人看课本来就会
+    //   中途离开（接水、回消息、走神）。机器挂机最显著的特征就是「匀速不停」，
+    //   加上这个与官方客户端同款的节奏，能把「挂机」特征进一步拉向「真人在看」。
+    //   暂停期间：不计学习时长（习惯分只算真实观看）、不判卡死、不唤醒，
+    //   到期由主循环的 ensurePlaying 自然恢复。
+    humanPause: true,        // 总开关
+    humanPauseChance: 0.003, // 每个主循环 tick（2 秒）的触发概率（0.3% ≈ 平均二十多分钟一次）
+    humanPauseMinSec: 30,    // 单次暂停时长随机下限（秒）
+    humanPauseMaxSec: 90,    // 单次暂停时长随机上限（秒）
+
+    // F2 断点续播
+    resume: true,
+    resumeRewind: 2,     // 恢复时回退秒数（保险）
+    resumeExpireDays: 7, // 记录过期天数
+    saveIntervalMs: 5000,// 进度写入节流间隔
+
+    // F3 AI 答题
+    autoAnswer: true,    // 默认开：用户要求「开启自动就是全部自动」，答题不需人工
+    answerMode: 'both',  // bank | llm | both
+    bankUrl: 'http://localhost:8060',
+    bankEnabled: false,      // 本版不接题库（不联网）
+    llmEnabled: false,       // 本版不接大模型（不联网、不填 Key）
+    llmBaseUrl: 'https://api.deepseek.com',
+    llmKey: '',
+    llmModel: 'deepseek-chat',
+    voteTimes: 3,        // LLM 投票次数
+    answerDelay: 3,      // 答题前延迟（秒）
+    answerDialog: true,  // 课中弹题自动答
+    answerHomework: false,// 作业页自动答（谨慎，默认关）
+    autoCloseDialog: true,// 答完自动关闭弹题（N4）
+
+    // ---- 在线作业 / 在线考试（守株待兔模式，见 src/06c-exam.js）----
+    // 用户明确要求：默认关闭，且【绝不自动跳转】到作业/考试页。
+    // 只有用户自己点进作答页（dohomework / doexamination）时才会工作。
+    autoExam: false,        // 默认关：自动答题（作业/考试）
+    examChapterFrom: 0,     // 起始章节，0 = 不限
+    examChapterTo: 0,       // 结束章节，0 = 不限
+    examSubmit: true,       // 答完是否自动提交（受 autoExam 总开关约束）
+    examSubmitDelay: 5,     // 提交前等待秒数（给用户反悔机会）
+    examSubjective: true,   // round-44：是否自动作答主观题(填空/问答)。受 autoExam 总开关约束；
+                            // 无 LLM Key/题库未命中时仍跳过并提示手动作答，绝不瞎填污染成绩
+
+    // 没配 LLM Key / 题库查不到时，是否随机蒙一个答案。
+    // 默认【关】：弹题大多计入平时分且很多课程不允许回退重做，
+    // 漏答还能回来手工作答，蒙错答却改不回来——宁可漏，不可错。
+    gatedRandom: false,
+
+    // 离线启发式兜底（round-30 新增）：题库/LLM 都没给出答案时，
+    // 用纯本地的语言学 + 出题套路推断一个（零网络、零 Key、零题库）。
+    //
+    // 为什么默认【开】：平台行为是「弹题随机弹出、且必须答完才能关闭」，
+    // 「不答」的代价不是漏一题，而是**弹窗关不掉、挂机当场中断**。
+    // 启发式不保证对，但质量高于随机、且能把「必卡死」变成「大概率继续」。
+    // 它有 Key 时不会出场（排在题库/LLM 之后），不会拉低已有答题质量。
+    heuristicFallback: true,
+
+    // 答案缓存模糊匹配（round-45）：同一道题的题干改几个字 / 换标点 / 多空格时，
+    // 按 90% 相似度复用本次运行内已答过的答案，少打一次题库/模型请求。
+    // 选项不一致的题绝不会误命中（选项串参与判等）。
+    fuzzyCache: true,
+
+    // 通用
+    debug: false,        // 控制台详细日志（排查时再开）
+    panelVisible: true,  // 悬浮面板
+    guardOverlays: true, // 弹窗守卫
+
+    // 全屏适配降级开关：进入全屏后脚本会先把悬浮面板「迁移」进全屏元素内部，
+    // 这样全屏看课时面板依然可见。只有迁移失败（极个别播放器不让挂）时，
+    // 本开关才起作用。
+    // 默认【false】：绝不擅自把用户从全屏里弹出来 —— 那体验极差。
+    // 用户主动打开后才允许「挂不上就自动退出全屏」。
+    exitFullscreenOnPanel: false,
+
+    // 课程中心调度
+    autoCourseHop: false, // 本版不自动跨课：只刷当前打开的这门课
+    autoCoursePick: false, // 本版不自动选课
+    // 自动学习总开关（v0.6.64 新增）：默认开启。
+    // 开启后，打开课程中心即自动进入「进度未达 100%」的课程开始听，
+    // 当前课听完自动退出并寻找下一门未看完的课（断点续播由 resume 负责）。
+    // 与 autoCourseHop/Pick 的关系：后两者是「学完自动跳下一门」的链，
+    // autoLearn 是「一进课程中心就自动开始学」的总授权；关闭则完全维持旧行为
+    // （只在 auto-hop 链里自动选课，手动打开课程中心不自动点，防劫持）。
+    // 红线不受影响：本开关只作用于听课链，绝不自动跳转作业/考试页（见 06c-exam FORBIDDEN）。
+    autoLearn: false,
+
+    // 自动停止（用户需求 1）
+    stopMode: 'none',    // none 不限 | minutes 按累计观看时长 | lessons 按完成节数
+    stopMinutes: 120,    // 累计观看多少分钟后自动停止
+    stopLessons: 10,     // 完成多少节后自动停止
+  };
+
+  // ============ 配置读写（GM 优先，降级 localStorage）============
+  const hasGM = typeof GM_setValue === 'function' && typeof GM_getValue === 'function';
+
+  /**
+   * 需要「布尔归一化」的配置字段。
+   * 起因：配置可能被脏数据写成字符串（GM 直写 / 老版本遗留 / 手工改存储），
+   * 而 `!"false"` 恒为 false —— 会把用户以为关掉的开关【偷偷打开】。
+   * 后者若发生在 autoExam（自动答题）上，等于在不知情下替用户答题，不可接受。
+   * 归一策略（失败侧优先/保守）：
+   *   - 布尔 → 原样
+   *   - 数字 → 非 0 为 true
+   *   - 字符串 → 仅 'true' / '1' 视为 true，其余（含 'yes'/'on'/'no'/'false'/'0' 等）一律 false
+   *     （保守：宁可把开关当关，也不误开）
+   *   - undefined / null → 由调用方保留默认值（不覆盖）
+   *   - 其它类型（对象/数组）→ false
+   */
+  const BOOL_KEYS = [
+    'autoPlay', 'autoNext', 'skipFinished', 'mute', 'resume',
+    'autoExam', 'examSubmit', 'examSubjective', 'autoCourseHop', 'autoCoursePick',
+    'autoLearn',
+    'exitFullscreenOnPanel', 'autoAnswer', 'bankEnabled', 'llmEnabled',
+    'answerDialog', 'answerHomework', 'autoCloseDialog', 'gatedRandom',
+    'heuristicFallback', 'humanPause', 'fuzzyCache',
+    'debug', 'panelVisible', 'guardOverlays',
+  ];
+
+  /** 单值布尔归一化；undefined/null 返回 undefined（表示「不覆盖」） */
+  function toBool(v) {
+    if (v === undefined || v === null) return undefined;
+    if (typeof v === 'boolean') return v;
+    if (typeof v === 'number') return v !== 0;
+    if (typeof v === 'string') {
+      const s = v.trim().toLowerCase();
+      return s === 'true' || s === '1';
+    }
+    return false;
+  }
+
+  /** 对配置对象里的布尔字段做原地归一化（undefined/null 保留原值） */
+  function normalizeBools(cfg) {
+    for (const k of BOOL_KEYS) {
+      const n = toBool(cfg[k]);
+      if (n !== undefined) cfg[k] = n;
+    }
+    return cfg;
+  }
+
+  /** 非负整数夹逼（章节范围等），非法值退化 0 */
+  function clampInt(v, max) {
+    const n = Math.floor(Number(v));
+    if (!Number.isFinite(n) || n < 0) return 0;
+    return Math.min(n, max == null ? 999 : max);
+  }
+
+  /**
+   * 配置迁移：老用户本地存的配置会压住新版本的默认值，
+   * 导致「代码改了默认但用户端不生效」。
+   * 每次重要默认值变更就把 CONFIG_REV +1，并把变更项写进 FORCE_UPGRADE。
+   */
+  const CONFIG_REV = 6;
+  const FORCE_UPGRADE = {
+    autoAnswer: true,     // 视频弹题必须作答才能继续；本版只用本地推测，不联网
+    gatedRandom: false,   // 默认不瞎蒙；设置里可开「答不出随机选（保进度）」
+    autoCourseHop: false, // 本版不自动跨课
+    autoCoursePick: false,
+    autoLearn: false,     // 只在用户自己打开的课程里顺序播放
+    // 注意：autoExam 故意【不】放进 FORCE_UPGRADE。
+    // 它的承诺是「默认关闭」，强推会把老用户的 configRev 升级顺便改成 true，
+    // 等于偷偷打开了自动答题 —— 破坏承诺，也会让用户在不知情下被代答。
+  };
+
+  /** 原始写入（不经过 getConfig，避免迁移递归） */
+  function store(obj) {
+    try {
+      const raw = JSON.stringify(obj);
+      if (hasGM) GM_setValue('zhs-seq-config', raw);
+      else localStorage.setItem('zhs-seq-config', raw);
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function getConfig() {
+    let saved = {};
+    try {
+      const raw = hasGM ? GM_getValue('zhs-seq-config', null)
+                        : localStorage.getItem('zhs-seq-config');
+      if (raw) saved = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    } catch (e) { /* 配置损坏则用默认 */ }
+    // 兜底：JSON.parse 可能产出 null / 数字 / 字符串 / 数组等非对象值
+    // （例如历史脏数据里存了字面量字符串 "null"）。此类值会让下面的
+    // saved.configRev 抛 TypeError，进而中断整份脚本。统一退化回空对象。
+    if (!saved || typeof saved !== 'object' || Array.isArray(saved)) saved = {};
+
+    const cfg = Object.assign({}, DEFAULTS, saved);
+
+    // 跨版本迁移：把重要变更项强制拉到新默认，并写回（只跑一次）
+    if (Number(saved.configRev || 0) < CONFIG_REV) {
+      for (const key of Object.keys(FORCE_UPGRADE)) cfg[key] = FORCE_UPGRADE[key];
+      cfg.configRev = CONFIG_REV;
+      store(cfg);
+    }
+
+    // 布尔归一化：把存储里的脏值（字符串 "false"/"no" 等）规整成真布尔。
+    // 必须在返回前统一做，因为 get config() 每次读取都会走到这里，
+    // 保证「直写存储」与「走 setConfig」两条路径拿到的都是干净布尔。
+    normalizeBools(cfg);
+    // 章节范围夹逼：与 06c-exam.js 的 clampCh 对齐，防止越权范围。
+    cfg.examChapterFrom = clampInt(cfg.examChapterFrom, 999);
+    cfg.examChapterTo = clampInt(cfg.examChapterTo, 999);
+    return cfg;
+  }
+
+  function saveConfig(patch) {
+    // 过滤 undefined/null：避免 patch 里显式的 undefined 覆盖掉默认值
+    const clean = {};
+    if (patch && typeof patch === 'object') {
+      for (const k of Object.keys(patch)) {
+        if (patch[k] !== undefined && patch[k] !== null) clean[k] = patch[k];
+      }
+    }
+    const next = Object.assign(getConfig(), clean);
+    // 倍速硬夹逼
+    next.speed = Math.min(Math.max(Number(next.speed) || 1, 0.5), 1.5);
+    // 布尔归一化 + 章节夹逼：直写 API 也要设防（面板走 floor，API/GM 直写不设防）
+    normalizeBools(next);
+    next.examChapterFrom = clampInt(next.examChapterFrom, 999);
+    next.examChapterTo = clampInt(next.examChapterTo, 999);
+    next.configRev = CONFIG_REV;
+    store(next);
+    return next;
+  }
+
+  // ============ 日志 ============
+  const LOG_BUFFER = [];       // 面板日志显示用，最多 200 条
+  const MAX_LOG = 200;
+
+  const Log = {
+    _push(level, args) {
+      const line = args.map((a) => {
+        if (a instanceof Error) return a.message;
+        if (typeof a === 'object') { try { return JSON.stringify(a); } catch (e) { return String(a); } }
+        return String(a);
+      }).join(' ');
+      const entry = { t: Date.now(), level, text: line };
+      // 面板缓冲只保留 info/warn/error；debug 仅进控制台，不占 200 条缓冲。
+      // 起因：课程中心等模块的常规 debug 日志会刷爆缓冲，把真告警挤掉。
+      // 注意：需要「面板可查」的关键排查线索必须用 info，不能用 debug。
+      if (level !== 'debug') {
+        LOG_BUFFER.push(entry);
+        if (LOG_BUFFER.length > MAX_LOG) LOG_BUFFER.shift();
+      }
+      const tag = '[智慧树助手]';
+      if (level === 'error') console.error(tag, ...args);
+      else if (level === 'warn') console.warn(tag, ...args);
+      else if (level === 'debug') { if (ZHS.config.debug) console.log(tag, ...args); }
+      else console.log(tag, ...args);
+      // 通知面板刷新
+      if (ZHS.panel && ZHS.panel.onLog) ZHS.panel.onLog(entry);
+    },
+    info(...a) { this._push('info', a); },
+    warn(...a) { this._push('warn', a); },
+    error(...a) { this._push('error', a); },
+    debug(...a) { this._push('debug', a); },
+    all() { return LOG_BUFFER.slice(); },
+    clear() { LOG_BUFFER.length = 0; },
+  };
+
+  // ============ 运行时状态 ============
+  const state = {
+    siteVersion: null,     // wisdom | fusion | hike | legacy | unknown
+    courseId: null,        // recruitAndCourseId
+    lessonKey: null,       // 当前课时标识
+    videoEl: null,         // 当前 video 元素
+    running: false,        // 主循环是否运行
+    answeredCount: 0,      // 已答题数
+    pausedByGuard: false,  // 是否因守卫暂停（验证码）
+    guardSince: 0,         // 本轮验证码守卫暂停的开始时刻（用于汇报等待了多久）
+    startedAt: Date.now(),
+    // round-31【弹题实时感知】：弹题处理实时状态（供面板状态卡展示）
+    dialogActive: false,   // 当前是否有弹题在场处理中
+    dialogPhase: 'none',   // none | detected | answering | answered | pending-human
+    dialogLastAt: 0,       // 最近一次弹题事件时间戳
+  };
+
+  window.__ZHS_HELPER__ = true;
+  // 记下版本：页面里若已有实例，守卫处要靠它告诉用户「你装的到底是哪个版本在跑」
+  window.__ZHS_HELPER_VERSION__ = (window.__ZHS_BUILD__ && window.__ZHS_BUILD__.version) || 'unknown';
+
+  const ZHS = {
+    // 版本号只认 package.json（build.js 注入到 window.__ZHS_BUILD__.version）。
+    // 此处不再硬编码，避免与 package.json 漂移（历史遗留的 '0.3.0' 就是这么来的）。
+    // 注意：必须读 window.__ZHS_BUILD__，不能用裸标识符 __ZHS_VERSION__。
+    // 历史坑：build.js 曾声明 `const __ZHS_VERSION__`，而本模块在独立 IIFE 里，
+    // 作用域上根本看不到外层 IIFE 的 const —— typeof 判断因此永远走 '0.0.0' 分支。
+    version: (() => {
+      try {
+        const b = window.__ZHS_BUILD__;
+        if (b && typeof b.version === 'string' && b.version) return b.version;
+      } catch (e) { /* 忽略 */ }
+      return '0.0.0';
+    })(),
+    DEFAULTS,
+    get config() { return getConfig(); },
+    setConfig: saveConfig,
+    Log,
+    state,
+    LOG_BUFFER,
+  };
+
+  window.ZHS = ZHS;
+  Log.info('助手已注入 v' + ZHS.version);
+})();
+
+/* ===== 01-util.js ===== */
+/**
+ * 通用工具函数：DOM 等待、可见性检测、节流、随机延迟
+ */
+(function () {
+  'use strict';
+  const ZHS = window.ZHS;
+  if (!ZHS) return;
+  // 重入守卫：SPA 二次注入时整个模块直接退出，避免定时器/监听器叠加
+  if (ZHS.__mod01_util) return;
+  ZHS.__mod01_util = true;
+
+  const Util = {
+    /** 睡眠 */
+    sleep(ms) { return new Promise((r) => setTimeout(r, ms)); },
+
+    /** 随机延迟 [min, max] 秒 → 毫秒 */
+    randomDelay(minSec, maxSec) {
+      const min = Math.max(0, Number(minSec) || 0) * 1000;
+      const max = Math.max(min, (Number(maxSec) || 0) * 1000);
+      return Util.sleep(min + Math.random() * (max - min));
+    },
+
+    /** 节流：立即执行首次，之后间隔 ms 执行 */
+    throttle(fn, ms) {
+      let last = 0;
+      let timer = null;
+      return function (...args) {
+        const now = Date.now();
+        const remain = ms - (now - last);
+        if (remain <= 0) {
+          last = now;
+          fn.apply(this, args);
+        } else if (!timer) {
+          timer = setTimeout(() => {
+            last = Date.now();
+            timer = null;
+            fn.apply(this, args);
+          }, remain);
+        }
+      };
+    },
+
+    /** 防抖 */
+    debounce(fn, ms) {
+      let timer = null;
+      return function (...args) {
+        clearTimeout(timer);
+        timer = setTimeout(() => fn.apply(this, args), ms);
+      };
+    },
+
+    /** 元素是否真实可见（宽高 > 0 且不透明度 > 0.05） */
+    isVisible(el) {
+      if (!el || !el.getBoundingClientRect) return false;
+      const style = getComputedStyle(el);
+      if (style.display === 'none' || style.visibility === 'hidden') return false;
+      const opacity = Number.parseFloat(style.opacity || '1');
+      if (!(opacity > 0.05)) return false;
+      const rect = el.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0;
+    },
+
+    /**
+     * 结构可见性：只排除 display:none / visibility:hidden / opacity:0，
+     * 不要求有尺寸。
+     *
+     * 为什么要两个判定：
+     *  - isVisible 用于「必须真能点到」的场景（比如按钮）
+     *  - isStructurallyVisible 用于「元素存在即算出现」的场景（比如弹题容器），
+     *    因为智慧树有些容器在特定布局下尺寸暂时为 0，但内容已经渲染好了，
+     *    用 isVisible 会误判成"没出现"，导致弹题漏处理。
+     */
+    isStructurallyVisible(el) {
+      if (!el) return false;
+      const style = getComputedStyle(el);
+      if (style.display === 'none' || style.visibility === 'hidden') return false;
+      const opacity = Number.parseFloat(style.opacity || '1');
+      if (!(opacity > 0.05)) return false;
+      return true;
+    },
+
+    /** 选择器组中是否有任一结构可见元素 */
+    hasStructurallyVisible(selector) {
+      const list = document.querySelectorAll(selector);
+      for (const el of list) {
+        if (Util.isStructurallyVisible(el)) return true;
+      }
+      return false;
+    },
+
+    /** 选择器组中是否有任一可见元素 */
+    hasVisible(selector) {
+      const list = document.querySelectorAll(selector);
+      for (const el of list) {
+        if (Util.isVisible(el)) return true;
+      }
+      return false;
+    },
+
+    /**
+     * 腾讯 Turing 滑块验证码是否「真的弹出来拦人」了（激活态）。
+     *
+     * 【为什么不能裸用选择器 —— 真机踩过的坑】
+     * turing.captcha.gtimg.com 的 iframe 在智慧树视频页是**常驻**的：
+     * 休眠态就是一个 300×150 的占位框，computed style 仍然是 display:block /
+     * visibility:visible / opacity:1。所以
+     *   hasStructurallyVisible('iframe[src*=turing]')
+     * 会**永久命中** → 守卫 1 一直拦截 → 脚本彻底停机。这是把「常驻占位」
+     * 当成「正在拦人」的典型误判。
+     *
+     * 真机实测：只有真正弹出来拦人时，它才会变成「居中、覆盖视口大半的
+     * fixed/absolute 浮层」，并且页面上出现可见文案
+     * 「安全验证 / 拖动下方滑块完成拼图」。所以判据取这两条（或关系）：
+     *   ① iframe 的祖先链里出现覆盖视口（宽 > 50% 且 高 > 40%）的 fixed/absolute 浮层
+     *   ② 页面上出现可见的「拖动下方滑块 / 安全验证」文本（只查叶子节点）
+     */
+    turingActive() {
+      try {
+        const f = document.querySelector('iframe[src*="turing"], iframe[src*="captcha.gtimg.com"]');
+        if (f) {
+          let n = f;
+          for (let i = 0; i < 8 && n; i++) {
+            const cs = getComputedStyle(n);
+            const r = n.getBoundingClientRect();
+            const covers = (r.width > window.innerWidth * 0.5)
+              && (r.height > window.innerHeight * 0.4);
+            // r.width/height 为 0 = 拿不到真实布局（如 jsdom / 元素尚未排版）。
+            // 有布局时用「覆盖视口」这个强判据；没有布局信息时退化为只看定位方式，
+            // 否则测试环境里永远判不出拦截态（真踩过）。
+            const sized = r.width > 0 && r.height > 0;
+            if ((cs.position === 'fixed' || cs.position === 'absolute')
+                && cs.display !== 'none' && (covers || !sized)) return true;
+            n = n.parentElement;
+          }
+        }
+      } catch (e) { /* 跨域/取不到样式一律当作没拦截 */ }
+
+      try {
+        const all = document.querySelectorAll('*');
+        for (let i = 0; i < all.length; i++) {
+          const el = all[i];
+          if (el.children.length !== 0) continue;        // 只看叶子，避免父容器整段文本误命中
+          if (!Util.isStructurallyVisible(el)) continue; // 不可见（display:none 等）跳过
+          const tx = Util.normText(el.textContent);
+          if (tx && /拖动下方滑块|安全验证|请完成验证/.test(tx)) return true;
+        }
+      } catch (e) { /* 忽略 */ }
+      return false;
+    },
+
+    /**
+     * 拟真点击：派发带坐标的 mousedown → mouseup → click 三连。
+     *
+     * 为什么不用 el.click()：真机实测（round-26）在智慧树目录上，
+     * 裸 click() 出现过整页跳到 www.zhihuishu.com 门户首页的情况；
+     * 而把带坐标的鼠标三连派发到小节标题 .catalogue_title 上，
+     * 稳定表现为「页内换 video 源、URL 始终不变」。
+     * 三连更接近人类操作序列，也更容易被 Vue 的监听器正确接收。
+     */
+    realClick(el) {
+      if (!el) return false;
+      try {
+        if (el.scrollIntoView) el.scrollIntoView({ block: 'center', inline: 'nearest' });
+      } catch (e) { /* 滚动失败不影响点击 */ }
+      try {
+        const r = el.getBoundingClientRect();
+        const o = {
+          bubbles: true, cancelable: true, view: window,
+          clientX: r.x + r.width / 2, clientY: r.y + r.height / 2,
+        };
+        el.dispatchEvent(new MouseEvent('mousedown', o));
+        el.dispatchEvent(new MouseEvent('mouseup', o));
+        el.dispatchEvent(new MouseEvent('click', o));
+        return true;
+      } catch (e) {
+        try { el.click(); return true; } catch (e2) { return false; }
+      }
+    },
+
+    /**
+     * 拟人化点击（round-35）：比 realClick 更接近人类操作序列。
+     *
+     * 仍是合成事件（页面 JS 无法产生 isTrusted=true 的事件），但智慧树反作弊主要
+     * 识别「瞬时、零位移、固定坐标」的机器点击。这里补上：随机起点 → 沿路径多步
+     * mousemove → 悬停 → 带微抖动的坐标点下 → 前后随机微延迟，把指纹从「机器」拉向「人」。
+     * 仅作为 Nav 策略③ 的最后兜底，不进主路径。
+     */
+    realClickHuman(el) {
+      if (!el) return false;
+      try { if (el.scrollIntoView) el.scrollIntoView({ block: 'center', inline: 'nearest' }); } catch (e) {}
+      const r = el.getBoundingClientRect();
+      if (!r || r.width === 0 || r.height === 0) { return Util.realClick(el); }
+      const cx = r.x + r.width / 2;
+      const cy = r.y + r.height / 2;
+      const jit = () => (Math.random() - 0.5) * 4;          // ±2px 抖动
+      const ev = (type, x, y) => {
+        try {
+          el.dispatchEvent(new MouseEvent(type, {
+            bubbles: true, cancelable: true, view: window,
+            clientX: x, clientY: y, screenX: x, screenY: y,
+          }));
+        } catch (e) { /* 忽略 */ }
+      };
+      const move = (x, y) => {
+        try {
+          document.dispatchEvent(new MouseEvent('mousemove', {
+            bubbles: true, cancelable: true, view: window, clientX: x, clientY: y,
+          }));
+        } catch (e) { /* 忽略 */ }
+      };
+      // 随机起点 → 沿直线插值到元素中心（6 步）
+      let sx = cx + (Math.random() - 0.5) * 120;
+      let sy = cy + (Math.random() - 0.5) * 120;
+      for (let i = 1; i <= 6; i++) {
+        const t = i / 6;
+        move(sx + (cx - sx) * t, sy + (cy - sy) * t);
+      }
+      move(cx, cy);
+      ev('mouseover', cx, cy);
+      ev('mousedown', cx + jit(), cy + jit());
+      ev('mouseup', cx + jit(), cy + jit());
+      ev('click', cx + jit(), cy + jit());
+      return true;
+    },
+
+    /** 等待元素出现 */
+    async waitFor(selector, timeoutMs = 20000, interval = 300) {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        const el = document.querySelector(selector);
+        if (el) return el;
+        await Util.sleep(interval);
+      }
+      return null;
+    },
+
+    /**
+     * 跨「同域 iframe」查找 video 元素
+     *
+     * 智慧树部分页面（尤其新形态/微前端容器）会把播放器嵌在 iframe 里，
+     * 顶层 document.querySelector('video') 永远落空 → 脚本判定「无视频」→ 整体不启动，
+     * 表现正是用户说的「功能全无用」。
+     * 顶层找不到时，递归遍历 iframe 的 contentDocument 找 video；跨域 iframe（取不到）
+     * 直接跳过——拿不到控制权就别硬来，至少顶层视频路径不受影响。
+     */
+    findVideoInIframes(doc) {
+      doc = doc || document;
+      try {
+        const frames = doc.querySelectorAll('iframe');
+        for (const f of frames) {
+          let idoc = null;
+          try { idoc = f.contentDocument || (f.contentWindow && f.contentWindow.document); } catch (e) { idoc = null; }
+          if (!idoc) continue;
+          const v = idoc.querySelector('video');
+          if (v) return v;
+          const nested = Util.findVideoInIframes(idoc);   // 嵌套 iframe 递归一层
+          if (nested) return nested;
+        }
+      } catch (e) { /* 安全策略禁止访问 iframe，忽略 */ }
+      return null;
+    },
+
+    /** 等待选择器组全部不可见（结构判定） */
+    async waitUntilHidden(selector, timeoutMs = 600000, interval = 500) {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        if (!Util.hasStructurallyVisible(selector)) return true;
+        await Util.sleep(interval);
+      }
+      return false;
+    },
+
+    /** 安全取值：带默认值 */
+    pick(obj, keys, fallback) {
+      for (const k of keys) {
+        if (obj && obj[k] !== undefined && obj[k] !== null && obj[k] !== '') return obj[k];
+      }
+      return fallback;
+    },
+
+    /** 从 URL 提取参数 */
+    getUrlParam(name) {
+      try {
+        const u = new URL(location.href);
+        return u.searchParams.get(name);
+      } catch (e) {
+        const m = location.search.match(new RegExp('[?&]' + name + '=([^&]+)'));
+        return m ? decodeURIComponent(m[1]) : null;
+      }
+    },
+
+    /** 文本归一化（去多余空白） */
+    normText(s) {
+      return String(s || '').replace(/\s+/g, ' ').trim();
+    },
+
+    /**
+     * 题干归一化（round-45）：去全部空白 + 中英标点，供模糊匹配用。
+     *
+     * 为什么不能直接用 normText：题库里同一道题常因「换行/全半角/标点差异」
+     * 被当成两道题，精确缓存永远命不中。去标点后这些差异全部抹平。
+     */
+    normQuestion(s) {
+      return String(s || '')
+        .replace(/[\s\u3000]+/g, '')
+        .replace(/[，。、；：？！""''（）《》【】〔〕—…·,.;:?!"'()\[\]<>]/g, '');
+    },
+
+    /**
+     * 编辑距离（Levenshtein，双行动态规划，O(min) 空间）。
+     * 空串与空串距离 0；单侧为空时为另一侧长度。
+     */
+    levenshtein(a, b) {
+      const s1 = String(a == null ? '' : a);
+      const s2 = String(b == null ? '' : b);
+      if (s1 === s2) return 0;
+      if (!s1) return s2.length;
+      if (!s2) return s1.length;
+      let prev = new Array(s2.length + 1);
+      let cur = new Array(s2.length + 1);
+      for (let j = 0; j <= s2.length; j++) prev[j] = j;
+      for (let i = 1; i <= s1.length; i++) {
+        cur[0] = i;
+        for (let j = 1; j <= s2.length; j++) {
+          const cost = s1.charCodeAt(i - 1) === s2.charCodeAt(j - 1) ? 0 : 1;
+          cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost);
+        }
+        const tmp = prev; prev = cur; cur = tmp;
+      }
+      return prev[s2.length];
+    },
+
+    /**
+     * 相似度（0~1）：1 - 编辑距离 / 较长串长度。
+     * 两个都空 → 1（视为相同，交给调用方的长度门槛去拦）。
+     */
+    similarity(a, b) {
+      const s1 = String(a == null ? '' : a);
+      const s2 = String(b == null ? '' : b);
+      const m = Math.max(s1.length, s2.length);
+      if (!m) return 1;
+      return 1 - Util.levenshtein(s1, s2) / m;
+    },
+
+    /** 在元素内按文本查找子元素 */
+    findByText(root, selector, keywords) {
+      const list = (root || document).querySelectorAll(selector);
+      const kws = Array.isArray(keywords) ? keywords : [keywords];
+      for (const el of list) {
+        const t = Util.normText(el.innerText || el.textContent);
+        if (kws.some((k) => t.includes(k))) return el;
+      }
+      return null;
+    },
+  };
+
+  ZHS.Util = Util;
+
+  /**
+   * 共享常量（单一真源）。
+   *
+   * 为什么要抽出来：弹题容器的选择器此前在 src/05-scheduler.js 与 src/08-questions.js
+   * 各写了一份字面量。两份只要有一处改动没同步，就会出现：
+   *   调度器守卫判定「这是弹题」→ 答题模块却找不到容器（或反过来），
+   *   表现是弹窗明明在屏幕上、脚本却完全不处理（2026-09-19 用户报的「脚本没有在答这种题」）。
+   * 现在统一从这里取，两边都用 `ZHS.Const.QUESTION_SELECTORS || '<兜底字面量>'` 兜底取值——
+   * 兜底字面量是为了防模块加载顺序异常（例如本模块被重入守卫提前 return），
+   * 拿不到常量时至少还能用默认串工作，而不是整个答题链路静默失效。
+   *
+   * 选择器说明：
+   *  - `#playTopic-dialog` / `[class*="topic-dialog"]`：智慧树标准课中弹题容器。
+   *  - `.el-dialog__wrapper .el-dialog`：Element UI 弹窗（「选对才能关」的 A/B 简单答题就是这种），
+   *    它的 class 里不含 `topic-dialog` 子串，只写前两个选择器会完全匹配不到。
+   */
+  ZHS.Const = ZHS.Const || {};
+  ZHS.Const.QUESTION_SELECTORS =
+    '#playTopic-dialog, [class*="topic-dialog"], .el-dialog__wrapper .el-dialog,'
+    // round-39b：AI 助教随堂练习弹题双变体（ocsjs 原厂：StudyPlusH5=.ai-test-question-wrapper，
+    // WishdomH5=.ai-class-exercise-dialog）。补进来才能被守卫/Observer 检测到，进而分流到简单处理器。
+    + ' .ai-test-question-wrapper, .ai-class-exercise-dialog';
+
+  /**
+   * 平台「视为已完成」的进度阈值（单一真源）。
+   *
+   * 为什么是 91：竞品 fuckZHS 的实测配置 end_thre = 0.91，其原话注释是
+   * 「智慧树把高于一定百分比的进度视为完成，0.91 保险一点」。
+   * 智慧树的进度记录常停在 91~99% 就不再上报，门槛定高了会把「已完成」判成「未完成」。
+   *
+   * 历史问题：本项目原先 02-adapter.js 写 98、05-scheduler.js 写 95、06b-course-hub.js 写 98，
+   * 三处各自为政；只要有一处更严，就会出现「目录说完成了、调度器说没完成」的打架，
+   * 表现为课时被反复回退重播。现在统一从这里取，
+   * 各处用 `(ZHS.Const && ZHS.Const.FINISH_PCT) || 91` 兜底（防模块加载顺序异常）。
+   */
+  ZHS.Const.FINISH_PCT = 91;
+})();
+
+/* ===== 02-adapter.js ===== */
+/**
+ * 适配层：自动识别智慧树页面版本，提供统一的目录访问接口
+ *
+ * 智慧树有 5 套并存的页面结构（wisdom / fusion / hike / legacy / card2025），
+ * 本模块把它们统一成同一组方法，上层业务代码无需关心版本差异。
+ */
+(function () {
+  'use strict';
+  const ZHS = window.ZHS;
+  if (!ZHS || !ZHS.Util) return;
+  // 重入守卫：SPA 二次注入时整个模块直接退出，避免定时器/监听器叠加
+  if (ZHS.__mod02_adapter) return;
+  ZHS.__mod02_adapter = true;
+  const U = ZHS.Util;
+
+  /**
+   * 目录适配器定义
+   * - item       章节条目选择器
+   * - active     当前项选择器
+   * - finish     完成标识选择器（存在即已完成）
+   * - title      课时名选择器
+   * - progress   进度值选择器（可选）
+   * - progressAttr 进度属性名（有则读属性，无则读文本）
+   */
+  const ADAPTERS = {
+    wisdom: {
+      name: 'wisdom',
+      label: '智慧版共享课',
+      item: '.child-info.hasvideo',
+      active: '.child-info.hasvideo.current',
+      finish: '.child-check',
+      title: '.child-name',
+      progress: '[role="progressbar"][aria-valuenow]',
+      progressAttr: 'aria-valuenow',
+      container: '.chapter-tree-74',
+      courseTitle: '.course-name',
+      locked: '.lock-icon, .icon-lock, [class*="lock"]',
+    },
+    fusion: {
+      name: 'fusion',
+      label: 'AI助教翻转课',
+      // 【2026-10-06 校准】item 原为 .chapter-content-second —— 那只是「当前展开层级的子节点」，
+      // 真站实测 58 节里只命中 4 节，于是目录残缺、findNext 找不到下一节，
+      // 正是用户报的「没办法自动跳」。完整课时列表在 .chapter-item
+      // （Autovisor FUSION_CATALOG 与 ocsjs zhs.ts:426 两个独立信源结论一致）。
+      // active 仍挂在课时内部子节点上（.chapter-item 自身没有 active class），
+      // scoreAdapter 的「active 必须是 item 命中节点本身或其后代」与 clickAndVerify 都按后代匹配。
+      item: '.chapter-item',
+      active: '.chapter-content-second.current',
+      activeClass: 'current',
+      finish: '.finish-icon',
+      title: '.item-name',
+      // 融合课每个课时带一个圆形进度环 .el-progress，aria-valuenow 是真实已学百分比（能读到中间值）。
+      // 原先缺失 → 融合课下 progressOf 永远读不到进度，完成判定只剩 finish 图标一条路。
+      progress: '.el-progress',
+      progressAttr: 'aria-valuenow',
+      container: '.chapter-content',
+      courseTitle: '.course-name',
+      locked: '[class*="lock"]',
+    },
+    hike: {
+      name: 'hike',
+      label: '新形态课',
+      item: '.file-item',
+      active: '.file-item.active',
+      activeClass: 'active',
+      finish: '.icon-finish',
+      title: 'span[title]',
+      progress: '.rate',
+      container: '.el-tree',
+      courseTitle: '.course-name',
+      locked: '.el-icon-lock, [class*="lock"]',
+    },
+    legacy: {
+      name: 'legacy',
+      label: '旧版共享课',
+      item: '.clearfix.video',
+      active: '.clearfix.video.current_play',
+      finish: '.time_icofinish',
+      // 旧版共享课的课时名：OCS getChapterName 用 .catalogue_title，
+      // 老页面里还写作 <span id="lessonOrder">。两个都写，命中谁算谁。
+      title: '#lessonOrder, .catalogue_title',
+      // 【round-26 真机校准】切课时要点「内部标题」而不是条目本体：
+      // 真机实测把带坐标的鼠标三连派发到 .catalogue_title 上 → 页内换 video 源、
+      // URL 始终停在 studyvideoh5（成功的页内切集）；而点 li 本体（el.click()）
+      // 出现过整页跳到 www.zhihuishu.com 门户首页的情况。
+      // Catalog.click 会优先用这个目标，取不到才退回点条目本体。
+      clickTarget: '.catalogue_title, #lessonOrder',
+      progress: '.progress-num',
+      container: '.clearfix',
+      courseTitle: '.source-name',
+      locked: '[class*="lock"]',
+    },
+    card2025: {
+      name: 'card2025',
+      label: '2025新版卡片式',
+      item: '[class*="card-container"]',
+      active: '[class*="card-container"].active',
+      finish: '.finished-icon',
+      title: '.video-title, .common-text',
+      container: '.section-item-collapse-info',
+      courseTitle: '.header-title-wrap',
+      locked: '[class*="lock"]',
+    },
+    // polymas 系（智慧树新形态教学中心，Vue3 + Aliplayer）
+    polymas: {
+      name: 'polymas',
+      label: '智慧树·AI课程中心',
+      item: '[class*="course-node"], [class*="chapter-item"], .catalog-item, [class*="lesson-item"]',
+      active: '[class*="course-node"].active, [class*="chapter-item"].active, .catalog-item.active, [class*="lesson-item"].active',
+      activeClass: 'active',
+      // 【2026-09-19 修正】原来是裸通配 `[class*="done"]`，而 isFinished 的第 1 层
+      // 是「命中即完成」、不设任何形态约束。polymas 一旦当选，外层容器
+      // （lesson-done-wrap / study-finish-box 之类）会让整目录瞬间全判完成 → allDone 停摆。
+      // 这里收紧成图标型元素，把误伤堵在源头。
+      finish: 'i[class*="finish"], i[class*="done"], i[class*="complete"], span[class*="finish"], span[class*="done"], [class*="finish-icon"], [class*="done-icon"], .is-finish, .is-done',
+      title: '[class*="title"], span[title]',
+      progress: '[class*="progress"], [role="progressbar"]',
+      container: '#main',
+      courseTitle: '[class*="course-name"], [class*="title"]',
+      locked: '[class*="lock"], [class*="disabled"]',
+    },
+  };
+
+  /**
+   * 通用兜底扫描器（适配器选择器全部落空时启用）
+   *
+   * 思路：不猜具体类名，而是从「结构特征」反推哪些元素像课程目录条目：
+   *   1. 兄弟节点成群（≥3 个同构兄弟）→ 像列表
+   *   2. 每个节点里有可读文本（课时名）
+   *   3. 节点不是纯容器（自身文本占比不能太低，太高则是大容器）
+   *   4. 优先取「文本长度适中（2~60 字）」且可点击的节点
+   *
+   * 这样即使 polymas 改版换类名，也能捞到目录。
+   */
+  function sniffItems() {
+    const out = [];
+    const seen = new Set();
+
+    // 候选容器：页面上所有元素，按「子元素数量」筛出像列表的
+    const all = document.querySelectorAll('div, li, a');
+    const groups = new Map();   // key = 父节点，value = 子节点数组
+
+    for (const el of all) {
+      const parent = el.parentElement;
+      if (!parent) continue;
+      if (!groups.has(parent)) groups.set(parent, []);
+      groups.get(parent).push(el);
+    }
+
+    for (const [, kids] of groups) {
+      if (kids.length < 3) continue;                 // 少于 3 个不成列表
+      // 同构判定：标签名 + class 主体一致
+      const sig = (el) => el.tagName + '|' + String(el.className || '').split(/\s+/).slice(0, 2).join('.');
+      const sigs = new Set(kids.map(sig));
+      if (sigs.size > 2) continue;                   // 结构太杂，不像同级列表
+
+      for (const el of kids) {
+        if (seen.has(el)) continue;
+        const txt = U.normText(el.innerText || el.textContent);
+        if (!txt) continue;
+        if (txt.length < 2 || txt.length > 80) continue;   // 太短不可能是课时名，太长是大容器
+        // 排除明显是导航/表单的
+        if (/登录|注册|首页|我的|设置|退出/.test(txt) && txt.length < 8) continue;
+        seen.add(el);
+        out.push(el);
+      }
+    }
+
+    // 按 DOM 顺序返回，保证「下一节」的方向正确
+    return out.sort((a, b) => {
+      const pos = a.compareDocumentPosition(b);
+      if (pos & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+      if (pos & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+      return 0;
+    });
+  }
+
+  /**
+   * 域名权重提示（不再是「一锤定音」的硬路由）
+   *
+   * 【2026-09-18 二次修正】我一度把 studyvideoh5 的 hike（.file-item）置顶，
+   * 依据是 GreasyFork 上一个脚本 gf558335；但更权威的 OCS（ocsjs-zhs.ts:81/139/825）
+   * 明确写着 StudyVideoH5 用的是 .clearfix.video（legacy），
+   * 而 .file-item 只出现在「校内课 xnk-study」（同文件 1520/1551 行）。
+   * gf558335 的 @match 是全站通配 *://*.zhihuishu.com/*，它在校内课能跑，
+   * 不代表 studyvideoh5 也是这套结构——这条证据我当时误归属了。
+   *
+   * 根子上的问题是：**按域名硬写优先级这件事本身就不可靠**，平台随时改版，
+   * 昨天的答案今天就变成坑（用户反馈「功能全无用」正是这么来的）。
+   * 所以这里降级为「加分项」，真正拍板交给 detect() 的评分选举：
+   * 谁命中得多、谁能定位到「当前项」，谁上。
+   */
+  /**
+   * 自动推导适配器（通用兜底增强）
+   *
+   * 【2026-10-21 根治「切不动课」】用户那门「Windows版/Mac版」课掉进通用兜底分支：
+   * items() 用 sniffItems() 能捞到 20 个候选，但 current()/isFinished()/hasActive()/click()
+   * 全部沿用 wisdom 适配器的选择器（.child-info.hasvideo.current / .child-check …），
+   * 在该布局上一个都匹配不上 → current() 恒为 null → clickAndVerify 的 nowIsTarget 永远 false
+   * → 只能指望视频源变化（非视频节点无视频源）→ 反复点、永远判失败 → 「切不动」。
+   *
+   * 这里不再硬套常量选择器，而是**从 sniffItems 捞到的真实候选里反推**：
+   *   - 当前项：候选里 className 命中 active/current/on/selected/playing 的（行业通用约定）
+   *   - 完成标记：候选后代中 class 含 finish/done/complete/check 且为图标/空壳的
+   *   - 可点目标：候选本身（兜底），或其中最可能带点击处理器的子节点
+   * 这样未知布局也能正常切课，而不是卡死。仅在 detect() 无任何已知适配器命中时启用，
+   * 已知布局完全走原逻辑，零回归风险。
+   */
+  const AUTO_ACTIVE_RE = /(^|\s)(active|current|on|selected|playing|cur|now|focus)(\s|$)/i;
+  const AUTO_FINISH_RE = /(finish|done|complete|check|learned|studied|passed)/i;
+  function buildAutoAdapter() {
+    const cands = sniffItems();
+    if (!cands.length) return null;
+    // 容器：拥有最多候选的父节点
+    const pc = {};
+    for (const c of cands) {
+      const p = c.parentElement;
+      if (p) pc[p] = (pc[p] || 0) + 1;
+    }
+    let container = null, max = 0;
+    for (const k in pc) if (pc[k] > max) { max = pc[k]; container = k; }
+    return {
+      name: 'auto', label: '自动推导(兜底)', item: null, container: null,
+      _cands: cands, _container: container,
+    };
+  }
+
+  /**
+   * 通用「当前项」反推：给定一份目录条目列表，用行业通用约定定位当前播放项。
+   * 用于两处：① auto 适配器的 current()；② 已知适配器专属 active 选择器失效时的兜底（治「切不动课」）。
+   * 判定优先级（由强到弱）：
+   *   1. 条目 className 命中 active/current/on/selected/playing 等通用约定
+   *   2. 条目后代含 active/current 类
+   *   3. lessonKey 文本精确匹配
+   *   4. 播放媒体（video/audio）就近反推（媒体是某条目后代，或某条目包含媒体）
+   */
+  function reverseCurrentFrom(list) {
+    if (!list || !list.length) return null;
+    // 1. className 命中通用「当前项」约定
+    let hit = list.find((c) => AUTO_ACTIVE_RE.test(String(c.className || '')));
+    if (hit) return hit;
+    // 2. 后代含 current/active 类
+    hit = list.find((c) => {
+      try { return !!c.querySelector('.active, .current, .on, .selected, [class*="current"], [class*="active"]'); } catch (e) { return false; }
+    });
+    if (hit) return hit;
+    // 3. lessonKey 文本匹配
+    const key = ZHS.state.lessonKey;
+    if (key) {
+      const byKey = list.find((c) => U.normText(c.innerText || c.textContent) === key);
+      if (byKey) return byKey;
+    }
+    // 4. 播放媒体就近反推
+    try {
+      const media = document.querySelector('video, audio');
+      if (media) {
+        let pm = media.parentElement;
+        while (pm) {
+          if (list.includes(pm)) return pm;
+          pm = pm.parentElement;
+        }
+        const owner = list.find((c) => c.contains(media));
+        if (owner) return owner;
+      }
+    } catch (e) { /* 忽略 */ }
+    return null;
+  }
+
+  /** auto 适配器：从推导候选里反推当前播放项 */
+  function autoCurrent() {
+    const ad = Catalog.adapter;
+    if (!ad || ad.name !== 'auto') return null;
+    return reverseCurrentFrom(ad._cands || sniffItems());
+  }
+
+  /** auto 适配器：判断候选是否已完成 */
+  function autoIsFinished(el) {
+    if (!el) return false;
+    try {
+      const badges = el.querySelectorAll('i, span, em, img, svg, b, strong');
+      for (const n of badges) {
+        const cls = String(n.className || '');
+        if (AUTO_FINISH_RE.test(cls)) {
+          const tag = String(n.tagName || '').toLowerCase();
+          if (/^(i|span|em|img|svg|b|strong)$/.test(tag)) return true;     // 图标型
+          if (!n.firstElementChild) return true;                            // 空壳（可能就是那个勾）
+        }
+      }
+      // 文本兜底：已完成 / 已学完
+      if (/(已完成|已学完|已学习|学完|已看完|已通过)/.test(U.normText(el.innerText || el.textContent))) return true;
+    } catch (e) { /* 忽略 */ }
+    return false;
+  }
+
+  function hostBonus(name) {
+    const host = location.hostname;
+    if (host.includes('polymas.com')) return name === 'polymas' ? 5 : 0;
+    if (host === 'hike.zhihuishu.com') return name === 'hike' ? 5 : 0;
+    if (host.includes('fusioncourseh5')) return name === 'fusion' ? 5 : 0;
+    if (host.includes('studywisdomh5')) return name === 'card2025' ? 5 : 0;
+    if (host.includes('studyplush5')) return name === 'wisdom' ? 5 : 0;
+    // studyvideoh5：给 legacy（ocsjs 权威）与 wisdom（Autovisor 默认兜底）加分。
+    // 【2026-09-18 三次修正】这里原本给 hike 也加 3 分，但 Autovisor 是独立于 ocsjs 的
+    // 第二个信源，它在 modules/lesson_navigation.py:84-85 把 .file-item 硬锁在 hike 域
+    // （`if "hike.zhihuishu.com" in course_url: return (HIKE_CATALOG,)`，单元素元组），
+    // studyvideoh5 走 :88 的 (WISDOM, LEGACY, FUSION) 兜底，hike 压根不在候选里。
+    // 两个独立项目在同一件事上结论一致 → 给 hike 加分是错的。
+    // 注意：hike 拿 0 分但**不退出候选池**，仍参与评分选举 —— 万一将来真改版成 el-tree，
+    // 评分照样能把它选上来，不会静默失效。这才叫"不赌，也不封闭"。
+    if (host.includes('studyvideoh5')) return (name === 'legacy' || name === 'wisdom') ? 3 : 0;
+    return name === 'wisdom' ? 2 : 0;
+  }
+
+  /** 候选池：顺序只作同分时的稳定 tie-break，不再代表优先级 */
+  function candidates() {
+    return [ADAPTERS.legacy, ADAPTERS.hike, ADAPTERS.wisdom, ADAPTERS.fusion, ADAPTERS.card2025, ADAPTERS.polymas];
+  }
+
+  /**
+   * 给一套适配器打分，越高越像「当前页面真正的目录」
+   * 评分维度（按可信度从强到弱）：
+   *   1. 能定位到「当前项」（active / current_play）——+100，这种组合只有真目录才有，
+   *      正是它防住了「某套选择器碰巧在页面别处存在 → 抢占识别」的老 bug
+   *   2. 命中专属容器（.el-tree / .chapter-tree-74 等）——+20，页面骨架对得上
+   *   3. 命中条目数（30 封顶）——每条 +1
+   *   4. 条目能读出课时名——每条 +2，防止命中一堆空壳节点
+   */
+  function scoreAdapter(ad) {
+    let list = [];
+    try { list = Array.from(document.querySelectorAll(ad.item)); } catch (e) { return -1; }
+    if (!list.length) return 0;
+
+    let score = Math.min(list.length, 30);
+    // 1. 能找到「当前项」是最强信号，但有两个前提，否则会翻车：
+    //    (a) active 元素必须是本套 item 命中的节点之一 —— 页面别处一个 .active 不该给它加满分
+    //    (b) 该节点要真的可见 —— 上一段残留的、display:none 的旧容器不该拿满分
+    //    （旧写法用全页 querySelector 找 active，两套 DOM 并存时公式会塌缩成「只比谁节点多」）
+    try {
+      if (ad.active) {
+        const actives = Array.from(document.querySelectorAll(ad.active));
+        const inList = actives.filter((a) => list.some((el) => el === a || el.contains(a)));
+        if (inList.some((a) => U.isVisible(a))) score += 100;
+        else if (inList.length) score += 40;   // 命中但不可见：降权，不作数
+      }
+    } catch (e) { /* 选择器兼容 */ }
+    try { if (ad.container && document.querySelector(ad.container)) score += 20; } catch (e) { /* 选择器兼容 */ }
+
+    let titled = 0;
+    for (const el of list.slice(0, 30)) {
+      const t = U.normText(el.innerText || el.textContent);
+      if (t && t.length >= 2 && t.length <= 80) titled++;
+    }
+    score += titled * 2;
+    score += hostBonus(ad.name);
+    return score;
+  }
+
+  /** 轮询等待条件成立（SPA 异步切换的通用等待器） */
+  async function waitUntil(fn, timeoutMs, interval) {
+    const deadline = Date.now() + timeoutMs;
+    interval = interval || 150;
+    while (Date.now() < deadline) {
+      let hit = false;
+      try { hit = !!fn(); } catch (e) { hit = false; }
+      if (hit) return true;
+      await U.sleep(interval);
+    }
+    return false;
+  }
+
+  /**
+   * 自动展开折叠的目录树 ——【2026-09-18 实地修正】
+   * 痛点：新版页面目录是 el-tree，章节默认折叠时目标课时根本不在 DOM 里，
+   * 于是「点了也没用」：脚本找不到下一节，即便找到也点不动一个不存在的节点。
+   * 这里在每次取目录之前，把没展开的章节全部点开。
+   */
+  const expandTreeOnce = U.throttle(function () {
+    let opened = 0;
+    try {
+      document.querySelectorAll('.el-tree-node__expand-icon:not(.is-leaf)').forEach((icon) => {
+        const expanded = icon.classList.contains('expanded')
+          || icon.getAttribute('aria-expanded') === 'true';
+        if (!expanded) { icon.click(); opened++; }
+      });
+    } catch (e) { /* 展开失败不影响主流程 */ }
+    if (opened > 0) ZHS.Log.info('已自动展开 ' + opened + ' 个折叠章节');
+    return opened;
+  }, 2000);
+
+  /**
+   * 条目状态枚举
+   *   done   已完成
+   *   undone 未完成（可点，需要看）
+   *   locked 未解锁（点不了，前置没完成）
+   *   na     不是可播放条目（纯目录/章节标题）
+   */
+  const STATUS = { DONE: 'done', UNDONE: 'undone', LOCKED: 'locked', NA: 'na' };
+
+  /**
+   * 探测当前页面用哪套适配器
+   *
+   * 【2026-09-18 修正】原来是「候选里第一个 querySelector 命中 1 个就算成功」，
+   * 这是导致用户「功能全无用」的直接原因之一：任何一套选择器只要碰巧在页面别处
+   * 存在一两个同名节点，就会抢占成功，真目录被顶掉，后续全部操作打在空气上。
+   * 现在改为评分选举：全部候选各打一次分，取最高且 >0 者。
+   */
+  /**
+   * 已知适配器能否在自身目录条目内定位到「当前项」（detect 自愈判据）。
+   * 只查「active 选择器命中且落在 item 列表内」，不强制可见，避免加载中途误判。
+   */
+  function adapterCanLocateCurrent(ad) {
+    try {
+      const list = Array.from(document.querySelectorAll(ad.item));
+      if (!list.length) return false;
+      if (!ad.active) return true;       // 无 active 选择器：不阻止该适配器
+      const actives = Array.from(document.querySelectorAll(ad.active));
+      const inList = actives.filter((a) => list.some((el) => el === a || el.contains(a)));
+      return inList.length > 0;          // 在目录条目内（含后代）找到 active 即视为可定位
+    } catch (e) { return false; }
+  }
+
+  function detect() {
+    let best = null;
+    let bestScore = 0;
+    const detail = [];
+    for (const ad of candidates()) {
+      const s = scoreAdapter(ad);
+      if (s > 0) detail.push(ad.name + '=' + s);
+      if (s > bestScore) { bestScore = s; best = ad; }
+    }
+    if (best) {
+      // 自愈（治「切不动课」根因）：胜出的是已知适配器，但它连「当前项」都定位不到
+      // （最强信号缺失），说明它只是选择器在页面别处碰巧命中、并非真目录。
+      // 此时若 auto 能从真实 DOM 推导出有规模的目录，则降级到 auto，从结构反推当前项/完成态，
+      // 而不是卡死在错误选择器上。判定很保守——仅当已知适配器命中节点数 < 3（明显不是真目录）
+      // 且 auto 推导出 ≥ 3 个候选时才降级，确保正常大目录布局（几十个节点）绝不误降级。
+      if (!adapterCanLocateCurrent(best)) {
+        const auto = buildAutoAdapter();
+        let knownCount = 0;
+        try { knownCount = document.querySelectorAll(best.item).length; } catch (e) { knownCount = 0; }
+        if (auto && auto._cands.length >= 3 && knownCount < 3) {
+          ZHS.state.siteVersion = 'auto';
+          ZHS.Log.warn('已知适配器「' + best.name + '」评分 ' + bestScore + ' 但仅命中 ' + knownCount
+            + ' 个节点且定位不到当前项，降级到 auto 兜底（候选 ' + auto._cands.length + ' 个）');
+          return auto;
+        }
+      }
+      ZHS.state.siteVersion = best.name;
+      ZHS.Log.info('页面版本识别为：' + best.label + ' (' + best.name + ')，评分 ' + bestScore
+        + (detail.length > 1 ? '；候选评分 ' + detail.join(' / ') : ''));
+      return best;
+    }
+    // 无任何已知适配器命中 → 尝试从真实 DOM 自动推导目录结构（治「切不动课」兜底布局）
+    const auto = buildAutoAdapter();
+    if (auto) {
+      ZHS.state.siteVersion = 'auto';
+      ZHS.Log.info('未知布局：已自动推导目录结构，候选 ' + auto._cands.length + ' 个，启用 auto 适配器');
+      return auto;
+    }
+    ZHS.state.siteVersion = 'unknown';
+    ZHS.Log.warn('未能识别页面版本，将使用通用兜底策略');
+    return ADAPTERS.wisdom; // 兜底
+  }
+
+  /**
+   * 目录操作 API
+   */
+  const Catalog = {
+    _ad: null,
+
+    get adapter() {
+      if (!this._ad) this._ad = detect();
+      return this._ad;
+    },
+
+    /** 强制重新探测（SPA 切页后调用） */
+    redetect() { this._ad = null; return this.adapter; },
+
+    /** 课程唯一标识 */
+    getCourseId() {
+      // 路径解析优先：polymas AI 课程学习页形如 /AIstudent/{courseId}/{lessonId}?key=…
+      // 此前只查 query/hash，学习页恒返回 'unknown-course'，导致断点 key 串台、去重失效（round-7 H2）
+      const pm = location.pathname.match(/\/AIstudent\/([^/?#]+)/);
+      if (pm && pm[1]) return pm[1];
+      return U.pick(
+        {
+          a: U.getUrlParam('recruitAndCourseId'),
+          b: U.getUrlParam('courseId'),
+          c: U.getUrlParam('recruitId'),
+        },
+        ['a', 'b', 'c'],
+        null
+      ) || (location.hash.match(/courseId[=\/](\w+)/) || [])[1]
+      // round-12：URL 全空时的兜底链——优先用课程中心进入时记录的真实课程 id（hubKey），
+      // 再退而求其次读 DOM 上的 data-course-id；避免长期返回 'unknown-course' 导致断点串台、自动跳课去重失效。
+      || (ZHS.state && ZHS.state.hubKey) || (function () {
+        const el = document.querySelector('[data-course-id]');
+        return el ? el.getAttribute('data-course-id') : null;
+      })() || 'unknown-course';
+    },
+
+    /** 课程名 */
+    getCourseName() {
+      const el = document.querySelector(this.adapter.courseTitle);
+      return el ? U.normText(el.innerText || el.textContent) : '';
+    },
+
+    /** 所有章节条目 */
+    items() {
+      expandTreeOnce(); // 先把折叠章节展开，否则折叠中的课时不在 DOM 里，取不到也点不到
+      // auto 适配器：item 为 null，直接走结构兜底扫描（与 detect 推导用同一套候选）
+      if (this.adapter.name === 'auto') {
+        const cands = sniffItems();
+        if (cands.length) {
+          if (!this._sniffed) { this._sniffed = true; ZHS.Log.warn('预设选择器未命中，已启用结构兜底扫描，捞到 ' + cands.length + ' 个候选条目'); }
+          return cands;
+        }
+        return [];
+      }
+      const list = Array.from(document.querySelectorAll(this.adapter.item));
+      // hike 版过滤掉目录树中间节点（有子节点的不是叶子）
+      if (this.adapter.name === 'hike') {
+        return list.filter((el) => {
+          const node = el.closest('.el-tree-node');
+          if (!node) return true;
+          const children = node.querySelector('.el-tree-node__children');
+          return !children || children.children.length === 0;
+        });
+      }
+      // 预设选择器全落空 → 启用通用兜底扫描（应对平台改版/新域名）
+      if (!list.length) {
+        const sniffed = sniffItems();
+        if (sniffed.length) {
+          if (!this._sniffed) {
+            this._sniffed = true;
+            ZHS.Log.warn('预设选择器未命中，已启用结构兜底扫描，捞到 ' + sniffed.length + ' 个候选条目');
+          }
+          return sniffed;
+        }
+      }
+      return list;
+    },
+
+    /** 当前播放的条目 */
+    current() {
+      const ad = this.adapter;
+      // auto 适配器：从推导候选里反推当前项（见 autoCurrent）
+      if (ad.name === 'auto') return autoCurrent();
+      // round-15【D3】：active 查询必须限定在目录容器内。
+      // 原先用 document.querySelector(ad.active) 全局查，只要页面别处（播放器控制条、
+      // 顶部导航、其他 tab）恰有带 active/current 类且标题文本又碰巧等于目标节的元素，
+      // 就会把「当前播放项」判成它 —— 于是 nowIsTarget()/_stillOnFrom() 全部跟着错，
+      // 「假成功」从另一侧回流（切错节也判成功、完成计数虚增）。
+      let cur = null;
+      try {
+        const scope = (ad.container && document.querySelector(ad.container)) || document;
+        cur = scope.querySelector(ad.active);
+      } catch (e) { /* 选择器兼容：失败则回落全局 */ }
+      if (!cur) {
+        try { cur = document.querySelector(ad.active); } catch (e) { /* 选择器兼容 */ }
+      }
+      // round-15【D3 强化】：命中的元素必须确实是目录条目之一，否则不算「当前播放项」。
+      // 这挡住「页面别处有同名 active 元素」的最后一种漏网情形。
+      if (cur) {
+        const list = this.items();
+        const isItem = list.some((el) => el === cur || el.contains(cur) || cur.contains(el));
+        if (isItem) return cur;
+      }
+      // 兜底：用 lessonKey 文本匹配（保留原有精确匹配）
+      const key = ZHS.state.lessonKey;
+      if (key) {
+        const byKey = this.items().find((el) => this.itemTitle(el) === key);
+        if (byKey) return byKey;
+      }
+      // 通用反推兜底（治「切不动课」根因）：已知适配器专属 active 选择器在该布局失效时，
+      // 从真实目录条目用行业通用约定（active/current 类名 / 媒体邻近）反推当前项。
+      // 正确布局的 current() 已在前面分支命中，不会走到这里 → 零回归。
+      const rev = reverseCurrentFrom(this.items());
+      if (rev) return rev;
+      return null;
+    },
+
+    /** 取条目名称 */
+    itemTitle(el) {
+      if (!el) return '';
+      const ad = this.adapter;
+      // auto 适配器：没有专属标题选择器，直接读条目自身文本（sniffItems 已保证是纯课时名）
+      if (ad.name === 'auto') return U.normText(el.innerText || el.textContent).slice(0, 80);
+      const readTxt = (n) => {
+        if (!n) return '';
+        const attr = n.getAttribute && n.getAttribute('title');
+        if (attr) return U.normText(attr);
+        return U.normText(n.innerText || n.textContent);
+      };
+      // 纯序号（如 legacy 的 #lessonOrder 只写了 "1.2"）不算课时名
+      const onlyNumber = (s) => !s || /^[\d.\s]*$/.test(s);
+
+      const t = readTxt(el.querySelector(ad.title));
+      if (!onlyNumber(t)) return t;
+
+      // 回退：在通用课时名容器里找第一个像名字的文本
+      const FALLBACK = '.catalogue_title, .video-name, .item-name, .child-name, .file-name, .time, [class*="title"], span[title]';
+      try {
+        for (const n of Array.from(el.querySelectorAll(FALLBACK))) {
+          const s = readTxt(n);
+          if (!onlyNumber(s) && s.length >= 2) return s;
+        }
+      } catch (e) { /* 忽略 */ }
+      return U.normText(el.innerText || el.textContent).slice(0, 80);
+    },
+
+    /**
+     * 条目是否已完成
+     * 完成判定的「金标准」是平台在章节列表（用户侧栏/右侧栏）打的完成标记（对勾/已完成图标）。
+     * 仅靠视频进度条判断会出问题：视频放完但平台进度条还停在 99% 时，会误判「没看完」→ 重播而非跳节。
+     * 所以优先级：专属完成标记 > 通用完成标记（覆盖各版本 class 变体）> 文本"已完成/已学完" > 进度 100%。
+     */
+    isFinished(el) {
+      if (!el) return false;
+      const ad = this.adapter;
+      // auto 适配器：用推导逻辑判断完成态（不依赖 wisdom 等专属选择器）
+      if (ad.name === 'auto') return autoIsFinished(el);
+      try {
+        // 1. 适配器专属完成标记（如 wisdom 的 .child-check / legacy 的 .time_icofinish）
+        if (ad.finish && el.querySelector(ad.finish)) return true;
+        // 1b. 标记打在 el 自身（1 @346 只有 querySelector 版本）
+        if (ad.finish && el.matches && el.matches(ad.finish)) return true;
+      } catch (e) { /* 选择器兼容 */ }
+      // 2. 条目自身带完成态 class（如 .file-item.done）
+      try {
+        if (/\b(done|finished|completed|is-finish|is-finished|study-done|learned)\b/i.test(String(el.className || ''))) return true;
+      } catch (e) { /* 忽略 */ }
+      // 3. 通用完成标记：必须是「图标型」节点才认
+      //    【2026-09-18 修正】原来只要子树里任一元素 class 含 finish/done/complete 就算完成。
+      //    太宽了：外层容器常叫 "lesson-done-wrap" / "study-finish-box"，一命中就把整条目判成已完成，
+      //    后果是 findNext 找不到「未完成」的节 → 直接弹「全部看完」白屏停止。
+      //    现在限定两种才算：标签是图标类，或该节点本身就是叶子（没有子元素）。
+      try {
+        const BADGE = '[class*="finish"], [class*="done"], [class*="complete"], [class*="learned"], [class*="studied"], [class*="checkmark"], [class*="is-finish"]';
+        for (const n of Array.from(el.querySelectorAll(BADGE))) {
+          const tag = String(n.tagName || '').toLowerCase();
+          if (/^(i|span|em|img|svg|b|strong)$/.test(tag)) return true;
+          if (!n.firstElementChild) return true;   // 空壳容器，可能就是那个勾
+        }
+      } catch (e) { /* 选择器兼容 */ }
+      // 3. 子元素文本兜底（有时完成标记是「已学完」三个字而非图标）
+      // 【2026-09-18 修正】原来是 `/…|100\s*%/` 包含匹配 + 单独的「进度>=100 也算完成」：
+      // 「100% 学习完成」这种进度说明也会命中，下一节的 100% 也会被误判为已完成；
+      // 但视频看完时平台侧常常仍停在 99%，以 100 为门槛会直接卡住不跳。
+      // 故改为：只认独立文本 /^(\d{1,3})%$/，且阈值取 FINISH_PCT —— 由平台自己的低位值决定，不是拍脑袋。
+      // 【2026-10-06 修正】阈值改为从 ZHS.Const.FINISH_PCT 取（单一真源），并由 98 下调到 91。
+      // 依据：竞品 fuckZHS 的实测配置 end_thre = 0.91（原话「智慧树把高于一定百分比的进度视为完成，0.91 保险一点」）。
+      // 原 98 的门槛会把「平台已视为完成、但进度环停在 91~97%」的课时判成未完成 → 反复回退重播，纯浪费。
+      const FINISH_PCT = (ZHS.Const && ZHS.Const.FINISH_PCT) || 91;
+      const t = U.normText(el.innerText || el.textContent);
+      if (/(已完成|已学完|已学习|学完|已看完)/.test(t)) return true;
+      if (!ad.progress) {
+        // 该套适配器没有进度选择器 → 只能靠文本百分比（取紧凑纯进度文本）
+        const m = t.match(/^\s*(\d{1,3})\s*%\s*$/);
+        if (m && Number(m[1]) >= FINISH_PCT) return true;
+        return false;
+      }
+      const pct = this._readProgress(el);
+      return pct >= FINISH_PCT;
+    },
+
+    /** 纯读进度值（不做完成态判断，避免与 isFinished 相互递归） */
+    _readProgress(el) {
+      const ad = this.adapter;
+      if (!el || !ad.progress) return 0;
+      let p = null;
+      try { p = el.querySelector(ad.progress); } catch (e) { return 0; }
+      if (!p) return 0;
+      let raw = ad.progressAttr ? p.getAttribute(ad.progressAttr) : (p.innerText || p.textContent);
+      raw = String(raw || '0').replace('%', '').trim();
+      const n = Number.parseFloat(raw);
+      if (!Number.isFinite(n)) return 0;
+      return Math.max(0, Math.min(100, Math.round(n)));
+    },
+
+    /** 条目是否未解锁 */
+    isLocked(el) {
+      if (!el) return false;
+      const ad = this.adapter;
+      // 1. 元素自身或内部有锁图标
+      if (ad.locked) {
+        try {
+          if (el.matches && el.matches(ad.locked)) return true;
+          if (el.querySelector(ad.locked)) return true;
+        } catch (e) { /* 忽略非法选择器 */ }
+      }
+      // 2. disabled / 不可点 属性
+      if (el.getAttribute) {
+        if (el.getAttribute('disabled') != null) return true;
+        if (el.getAttribute('aria-disabled') === 'true') return true;
+        if (el.getAttribute('data-locked') === 'true') return true;
+      }
+      // 3. 样式：pointer-events:none 或 明显的禁用态类名
+      try {
+        const cls = String(el.className || '');
+        if (/\b(disabled|is-disabled|lock|locked|forbid|no-permission)\b/i.test(cls)) return true;
+      } catch (e) { /* 忽略 */ }
+      // 4. 文本兜底
+      const txt = U.normText(el.innerText || el.textContent);
+      if (/未解锁|不可学习|暂无权限/.test(txt)) return true;
+      return false;
+    },
+
+    /**
+     * 三态判定
+     * @returns 'done' | 'undone' | 'locked' | 'na'
+     */
+    statusOf(el) {
+      if (!el) return STATUS.NA;
+      if (this.isFinished(el)) return STATUS.DONE;
+      if (this.isLocked(el)) return STATUS.LOCKED;
+      // 有标题且能点到 → 未完成
+      const t = this.itemTitle(el);
+      if (!t) return STATUS.NA;
+      return STATUS.UNDONE;
+    },
+
+    /**
+     * 全量扫描：给每个条目打状态（面板/报告用）
+     * @returns [{ index, title, status, progress, element }]
+     */
+    scan() {
+      return this.items().map((el, i) => ({
+        index: i,
+        title: this.itemTitle(el),
+        status: this.statusOf(el),
+        progress: this.progressOf(el),
+        element: el,
+      }));
+    },
+
+    /** 统计三态数量 */
+    breakdown() {
+      this.ensureCatalogLoaded();   // 补全虚拟滚动目录，避免漏算未完成节而误判「全部看完」
+      const list = this.scan();
+      const out = { total: 0, done: 0, undone: 0, locked: 0, na: 0 };
+      for (const it of list) {
+        out.total++;
+        out[it.status] = (out[it.status] || 0) + 1;
+      }
+      out.percent = out.total ? Math.round((out.done / out.total) * 100) : 0;
+      out.allDone = out.total > 0 && out.undone === 0;
+      return out;
+    },
+
+    /** 条目进度百分比 0-100（优先读真实进度条，已完成直接 100） */
+    progressOf(el) {
+      if (!el) return 0;
+      if (this.isFinished(el)) return 100;
+      return this._readProgress(el);
+    },
+
+    /**
+     * 找下一个「未完成且未锁」的条目
+     * 策略：当前位置往后找 → 找不到则从头补漏
+     * 跳过 done（已完成）和 locked（未解锁，点了也没用）
+     */
+    findNext(fromEl) {
+      // 第一轮：基于「当前已渲染的 DOM 快照」查找
+      let all = this.items();
+      if (!all.length) return null;
+
+      const pickable = (el) => this.statusOf(el) === STATUS.UNDONE;
+
+      let startIdx = 0;
+      if (fromEl) {
+        const i = all.indexOf(fromEl);
+        if (i >= 0) startIdx = i + 1;
+      }
+      // 1. 当前之后
+      for (let i = startIdx; i < all.length; i++) {
+        if (pickable(all[i])) return all[i];
+      }
+      // 2. 从头补漏（前面可能有跳过的）
+      for (let i = 0; i < Math.min(startIdx, all.length); i++) {
+        if (pickable(all[i])) return all[i];
+      }
+
+      // 【round-5 修复 · 对应「不能跳转下一集」候选根因】
+      // 第一轮没找到 → 目录可能是「虚拟滚动」，后面的未完成课时根本还没渲染进 DOM。
+      // 主动触发懒加载把目录补全，再按同样逻辑找一次。
+      this.ensureCatalogLoaded();
+      all = this.items();
+      if (fromEl) {
+        const i = all.indexOf(fromEl);
+        if (i >= 0) startIdx = i + 1;
+      }
+      for (let i = startIdx; i < all.length; i++) {
+        if (pickable(all[i])) return all[i];
+      }
+      for (let i = 0; i < Math.min(startIdx, all.length); i++) {
+        if (pickable(all[i])) return all[i];
+      }
+      return null;
+    },
+
+    /** 所有待学条目（未完成 + 未锁） */
+    pending() {
+      return this.items().filter((el) => this.statusOf(el) === STATUS.UNDONE);
+    },
+
+    /** 找指定名称的条目 */
+    findByName(key) {
+      if (!key) return null;
+      const all = this.items();
+      // 精确匹配优先
+      let hit = all.find((el) => this.itemTitle(el) === key);
+      if (hit) return hit;
+      // 包含匹配兜底
+      hit = all.find((el) => this.itemTitle(el).includes(key) || key.includes(this.itemTitle(el)));
+      return hit || null;
+    },
+
+    /**
+     * 条目是否处于「当前播放」状态
+     * 不单看适配器的 active 选择器（平台一改版就失效），而是三层判定：
+     *   1. 元素自身 class 出现 active / current_play / current / is-active / selected
+     *   2. 元素匹配适配器 active 选择器
+     *   3. 页面上唯一的「当前项」就是它（或互为包含关系）
+     */
+    hasActive(el) {
+      if (!el) return false;
+      const ad = this.adapter;
+      // auto 适配器：用通用「当前项」类名约定判断（行业通用，不依赖具体选择器）
+      if (ad.name === 'auto') {
+        let rawClass = '';
+        try { rawClass = String((el.className && el.className.baseVal !== undefined) ? el.className.baseVal : (el.className || '')); } catch (e) { rawClass = ''; }
+        if (AUTO_ACTIVE_RE.test(rawClass)) return true;
+        try { if (el.querySelector('.active, .current, .on, .selected, [class*="current"], [class*="active"]')) return true; } catch (e) { /* 忽略 */ }
+        return false;
+      }
+      let rawClass = '';
+      try {
+        rawClass = String((el.className && el.className.baseVal !== undefined) ? el.className.baseVal : (el.className || ''));
+      } catch (e) { rawClass = ''; }
+      const cls = rawClass.split(/\s+/);
+      // 1. 本套专属的「当前项」标记（如 legacy 的 current_play、hike 的 active）
+      if (ad.activeClass && cls.indexOf(ad.activeClass) >= 0) return true;
+      // 2. 通用词兜底（Element UI 的 is-current / 播放器 playing 等）
+      if (cls.some((c) => /^(active|current_play|current-play|current|is-active|is-current|selected|playing)$/i.test(c))) {
+        return true;
+      }
+      try { if (ad.active && el.matches && el.matches(ad.active)) return true; } catch (e) { /* 选择器兼容 */ }
+      try {
+        // round-14【P4】：限定在目录容器内查询，而不是整个 document。
+        // 原先 document.querySelector(ad.active) 会命中页面别处任意带 active 的容器
+        // （如播放器控制条、其他 tab），只要与 el 存在祖先/包含关系就误判为「当前项」，
+        // 造成「0 毫秒假成功」。收窄到 adapter.container 内可基本消除这类误判。
+        const scope = (ad.container && document.querySelector(ad.container)) || document;
+        const cur = ad.active ? scope.querySelector(ad.active) : null;
+        if (cur && (cur === el || el.contains(cur) || cur.contains(el))) return true;
+      } catch (e) { /* 选择器兼容 */ }
+      // 通用兜底：行业通用「当前项」类名约定（治「切不动课」，最后一道防线，仅当上述专属判定全失败）
+      try {
+        if (AUTO_ACTIVE_RE.test(rawClass)) return true;
+        if (el.querySelector('.active, .current, .on, .selected, [class*="current"], [class*="active"]')) return true;
+      } catch (e) { /* 忽略 */ }
+      return false;
+    },
+
+    /**
+     * 点击条目（真正触发切换）
+     *
+     * 【2026-09-18 修正】原来「优先点内部 a / span[title]」这一步是错的：
+     * Vue 的点击监听绑在目录条目本体（.file-item / .clearfix.video）上，
+     * 点内部一个纯展示用的 span/a 不等于点条目，于是「点了没反应」。
+     * 成熟实现（OCS 的 StudyVideoH5 条目点击）都是直接点条目本体。
+     * 另外补一步 scrollIntoView：部分页面条目不在视口内时不响应点击。
+     */
+    click(el) {
+      if (!el) return false;
+      try {
+        if (el.scrollIntoView) el.scrollIntoView({ block: 'center', inline: 'nearest' });
+      } catch (e) { /* 滚动失败不影响点击 */ }
+      // auto 适配器：未知布局下直接点条目本体最稳（上层 Nav 已先尝试 SPA 句柄直调，
+      // 若框架把处理器绑在容器/文档委托上，el.click() 冒泡即可触发）
+      if (this.adapter.name === 'auto') {
+        try { el.click(); return true; } catch (e) { ZHS.Log.error('auto 点击章节失败：', e.message); return false; }
+      }
+
+      // round-36：不再裸点容器 el。真机结论（legacy .catalogue_title）——点标题/链接
+      // 子元素才触发切集，点 li 本体有时整页跳门户首页。故按优先级挑「最可能带处理器」的
+      // 子目标，用拟人化点击派发；找不到合适子目标才回落 el.click()。
+      const target = this._bestClickTarget(el);
+      if (target && target !== el) {
+        const fire = U.realClickHuman || U.realClick;
+        if (fire && fire(target)) return true;
+      }
+
+      try {
+        el.click();
+        return true;
+      } catch (e) {
+        try {
+          const inner = el.querySelector('a, .child-name, .item-name, .file-name, span[title]');
+          if (inner) { inner.click(); return true; }
+        } catch (e2) { /* 放弃 */ }
+        ZHS.Log.error('点击章节失败：', e.message);
+        return false;
+      }
+    },
+
+    /**
+     * round-36：挑选目录项里「最可能绑定点击处理器」的子目标。
+     * 优先级（依据 legacy 真机：标题子元素可切、容器本体会跳门户）：
+     *   适配器 clickTarget → 标题/名称类子节点 → 带 onclick 的节点 → 真链接 a[href] → null（回落本体）
+     */
+    _bestClickTarget(el) {
+      if (!el || !el.querySelector) return null;
+      const ad = this.adapter;
+      const cands = [];
+      const push = (c) => { try { if (c && c !== el && cands.indexOf(c) < 0) cands.push(c); } catch (e) {} };
+      if (ad && ad.clickTarget) { try { push(el.querySelector(ad.clickTarget)); } catch (e) {} }
+      try {
+        const tn = el.querySelector('[class*="title"],[class*="name"],[class*="chapter"],[class*="text"],[class*="lesson"],[class*="catalogue"]');
+        push(tn);
+      } catch (e) {}
+      try { push(el.querySelector('[onclick]')); } catch (e) {}
+      try { push(el.querySelector('a[href]')); } catch (e) {}
+      return cands[0] || null;
+    },
+
+    /**
+     * 点击并校验是否真的切过去了
+     *
+     * 智慧树点目录是 SPA 异步切换，active class 往往晚几百毫秒才落到 DOM，
+     * 所以轮询等「目标条目拿到 active」；一直没动静就再点一次
+     * （首次点击常被遮罩层/播放器吞掉），两次都不动才判失败。
+     * SPA 重渲染还可能把节点换掉（detach），失败后按标题重新定位再点。
+     *
+     * @returns {Promise<boolean>} 是否确认已切换
+     */
+    async clickAndVerify(el, opt) {
+      opt = opt || {};
+      const timeout = opt.timeout || 3000;
+      const tries = opt.tries || 2;
+      const fromKey = opt.fromKey || null;   // round-14：切换前的课时标识，用第二信号比对
+      if (!el) return false;
+
+      const titleKey = this.itemTitle(el);
+      let target = el;
+      // round-42：auto 适配器「类名变化」软信号的状态快照。
+      // 点击前记录目标条目类名签名，点击后若「新增了任意非瞬态类名」即视为平台把当前项标记打上
+      // （自适应学习：不预设 active/current/selected 等具体词，平台用任何自定义类都认）。
+      const _sig = (node) => (node && node.getAttribute ? (node.getAttribute('class') || '') : '');
+      let sigBefore = '';
+      // round-15【D1】：预先记下目标与「切换前那一节」在目录里的索引，供 nowIsTarget 做身份比对
+      const _idxOf = (node) => {
+        try {
+          if (!node) return -1;
+          const list = this.items();
+          return list.findIndex((it) => it === node || it.contains(node) || node.contains(it));
+        } catch (e) { return -1; }
+      };
+      const fromIdx = fromKey ? _idxOf(this.items().find((it) => this.itemTitle(it) === fromKey)) : -1;
+
+      /**
+       * round-14【P4】第二信号：目标条目拿到 active 只是「间接信号」，会双向误判 ——
+       *   · 平台不打 active（改版/异步慢）→ 假失败：白等 9s、重复点、凑齐 5 次硬停；
+       *   · 页面别处恰有带 active 的容器（全局 querySelector 命中）→ 假成功：0 毫秒判过、完成计数虚增。
+       * 这里补一个独立判据：点完之后「目录里当前播放的那一项」必须确实等于目标项。
+       * 判据强度取「或」：只要 currentTitle 明确等于目标标题，就算成功（不依赖 active class）。
+       */
+      const nowIsTarget = () => {
+        try {
+          const cur = this.current();
+          if (!cur) return false;
+          // round-15【D1】：优先用「元素身份 / 目录索引」判断，而不是纯标题文本比对。
+          // 智慧树「习题讲解」「章节测验」这类同名节很常见：纯标题比对时，
+          // 只要第一节被设为 current，目标是第二节也会判成「已切到第二节」→ 假成功、
+          // 切错节、完成计数虚增。改用索引比对后可根治。
+          const list = this.items();
+          const curIdx = list.findIndex((it) => it === cur || it.contains(cur) || cur.contains(it));
+          const tgtIdx = list.findIndex((it) => it === target || it.contains(target) || target.contains(it));
+          if (curIdx >= 0 && tgtIdx >= 0) {
+            if (curIdx === tgtIdx) return true;     // 索引一致 → 确实切到目标
+            // 索引不一致且当前项就是切换前那一节 → 明确没切（即便标题同名也不误判）
+            if (fromIdx >= 0 && curIdx === fromIdx && curIdx !== tgtIdx) return false;
+            return false;                            // 当前项既不是目标也不是原节 → 未切到目标
+          }
+          // 索引取不到（SPA 换节点/items 未识别）→ 回落标题比对兜底
+          const curKey = this.itemTitle(cur);
+          if (!curKey) return false;
+          if (fromKey && curKey === fromKey && curKey !== titleKey) return false;
+          return curKey === titleKey;
+        } catch (e) { return false; }
+      };
+
+      /**
+       * round-16【P4】第三信号：页面级「确实切走了」痕迹。
+       * 老限制：某些平台版本/改版后「目录条目根本不打 active 类」，也没有可用的
+       * current 标记 —— 此时前两个信号（索引身份 / active）全部判不出来，
+       * 于是「明明切过去了」也被判失败 → 白等 9s + 重复点 + 凑齐 5 次硬停，
+       * 而这正是触发「瞬时故障停机 → 自愈 → 立刻又停」死循环的源头。
+       * 这里补一个与目录 DOM 无关的独立证据：视频源（src）或播放器区标题发生变化，
+       * 说明页面确实换了一集。点击前先快照，点击后比对。
+       */
+      const pageMark = () => {
+        try {
+          const v = document.querySelector('video');
+          const src = v ? String(v.currentSrc || v.src || '') : '';
+          // 播放器区标题（常见于标题栏/章节名展示区）
+          let titleTxt = '';
+          try {
+            const tEl = document.querySelector('.video-title, .chapter-name, .current-chapter, .play-title, .catalogue-name');
+            titleTxt = tEl ? String(tEl.textContent || '').replace(/\s+/g, '') : '';
+          } catch (e) { titleTxt = ''; }
+          return src + '||' + titleTxt;
+        } catch (e) { return ''; }
+      };
+      const markBefore = pageMark();
+      let markChanged = false;
+      const pageSwitched = () => {
+        try {
+          const now = pageMark();
+          if (now && markBefore && now !== markBefore) markChanged = true;
+          if (!markChanged) return false;
+          // 保护：页面标记变化必须伴随「已离开切换前那一节」，否则可能只是
+          // 广告/预加载/自适应码率导致 video.src 抖动，不能当成切换成功。
+          // 目录索引/标题任一能证明「已不在原节」即可放行；都判不出来时保守返回 false。
+          if (fromKey) {
+            const cur = this.current();
+            const curKey = cur ? this.itemTitle(cur) : '';
+            if (curKey && curKey === fromKey) return false;   // 还在原节 → 不算切换
+          } else {
+            const cur = this.current();
+            if (cur) {
+              const curKey = this.itemTitle(cur);
+              // 无 fromKey 时至少要求「当前项标题等于目标标题」才认
+              if (curKey && curKey !== titleKey) return false;
+            }
+          }
+          return markChanged;
+        } catch (e) { return false; }
+      };
+
+      /**
+       * round-42：auto 适配器的「类名变化」软信号（自适应学习当前项标记）。
+       * 背景：最坏布局下 current() 恒为 null（平台不给当前项挂标准 active 类名），
+       * 且非视频节点也无 video src 可比对 → nowIsTarget / _activeOnlyFallback / pageSwitched 全 false
+       * → 切课验收永远失败 → 反复点死循环（用户报的「正在切换课时中」）。
+       * 这里不预设平台用哪个类名：点击后若目标条目「新增了任意非瞬态类名」，
+       * 即视为平台已把当前项标记打上去（无论叫 active/current/selected/on/cur/zhang-current 什么）。
+       * 关键防护：点击若真没生效（类名不变）就返回 false —— 天然规避假成功，
+       * 不会把「点了没反应」误判成「切走」。瞬态类（hover/focus-visible/anim/loading/disabled 等）排除，防误判。
+       * 仅 auto 适配器生效，已知布局走原逻辑，零回归。
+       */
+      const autoClassFallback = () => {
+        if (this.adapter.name !== 'auto') return false;
+        const now = _sig(target);
+        if (!now || now === sigBefore) return false;
+        const added = now.replace(sigBefore, '').replace(/\s+/g, ' ').trim();
+        if (!added) return false;
+        if (/hover|focus-visible|anim|loading|disabled|transition|pulse|spinner|ripple/i.test(added)) return false;
+        return true;
+      };
+
+      for (let i = 0; i < tries; i++) {
+        // 点击前先确认还没切过去：若上次点击其实已生效（active 只是晚几拍才落到 DOM），
+        // 直接判成功即可，避免「重复点击当前节 → 平台重新加载本节」的怪象。
+        // round-14：只有「目标已是当前项」才算已生效；仅凭 active 不算（防假成功）。
+        if (nowIsTarget()) return true;
+        sigBefore = _sig(target); // round-42：点击前刷新类名快照
+        this.click(target);
+        // round-15【D2】判据修正：原先写的是 `hasActive(target) && !_stillOnFrom(...)`，
+        // 其中 _stillOnFrom 在 fromKey 为空时**恒返回 false**，于是整条判据退化成
+        // 「只要目标拿到 active 就算成功」= 第二信号完全失效，假成功/假失败的老问题回流。
+        // 现在改成「第二信号（nowIsTarget，基于目录索引的身份比对）为真才算成功」，
+        // active 只在第二信号无法判定（目录未识别）时才作为兜底。
+        // round-16【P4】：再叠第三信号 pageSwitched —— 视频源/播放器标题变了也算切成功，
+        // 治好「平台不给 active 就永远判失败」的老限制。
+        if (await waitUntil(
+          () => nowIsTarget() || this._activeOnlyFallback(target, fromKey) || pageSwitched() || autoClassFallback(),
+          i === 0 ? timeout : timeout * 2, 150
+        )) return true;
+        if (nowIsTarget() || pageSwitched() || autoClassFallback()) return true;
+        // 节点被 SPA 换掉 → 按标题重定位
+        if (!target.isConnected) {
+          const again = this.findByName(titleKey);
+          if (!again) return false;
+          target = again;
+        } else {
+          // 同 DOM 节点还在但不是 active，可能点击被遮罩吞掉。下一轮再点前先尝试
+          // 按标题重定位（万一 SPA 静默换过节点但 isConnected 仍是 true）。
+          const again = this.findByName(titleKey);
+          if (again && again !== target) target = again;
+        }
+      }
+      ZHS.Log.warn('点击「' + titleKey + '」' + tries + ' 次仍未见页面切换');
+      return false;
+    },
+
+    /**
+     * round-15【D2】：active 兜底判据 —— 仅在「目录索引完全不可用」时才允许依赖 active。
+     *
+     * 为什么需要兜底：某些页面 items() 识别不到（改版/未进播放页），此时基于索引的
+     * nowIsTarget 恒为 false，若只认它就会「明明切过去了却判失败」→ 白等 + 重复点 + 硬停。
+     * 但兜底必须比原来严格：光有 active 不够，还得确认「当前项已不是切换前那一节」，
+     * 否则回绕/同名节场景仍会假成功。
+     */
+    _activeOnlyFallback(target, fromKey) {
+      try {
+        if (!target || !this.hasActive(target)) return false;
+        // 目录索引可用时不许走兜底（交给更可靠的 nowIsTarget 判定）
+        const list = this.items();
+        const tgtIdx = list.findIndex((it) => it === target || it.contains(target) || target.contains(it));
+        if (tgtIdx >= 0) return false;
+        // 有 fromKey 时必须确认已离开原节
+        if (fromKey) {
+          const cur = this.current();
+          if (cur) {
+            const curKey = this.itemTitle(cur);
+            if (curKey && curKey === fromKey) return false;
+          }
+        }
+        return true;
+      } catch (e) { return false; }
+    },
+
+    /**
+     * round-14【P4 辅助】：判定「是否仍停在切换前那一节」。
+     * 用第二信号（当前项标题）做交叉校验，避免仅凭 active 判成功。
+     * 场景：目标条目拿到 active，但当前项其实还是 fromKey（回绕/误判）→ 不能算成功。
+     */
+    _stillOnFrom(fromKey, targetKey) {
+      if (!fromKey) return false;
+      try {
+        const cur = this.current();
+        if (!cur) return false;
+        const curKey = this.itemTitle(cur);
+        return !!curKey && curKey === fromKey && curKey !== targetKey;
+      } catch (e) { return false; }
+    },
+
+    /** 全部章节完成度统计 */
+    /**
+     * 列出当前页面里「可滚动且内容溢出」的目录容器
+     * 优先用适配器的 container 选择器，否则用一组常见目录滚动容器兜底。
+     * jsdom / 无布局环境下 scrollHeight、clientHeight 均为 0，不会命中任何容器，安全降级。
+     */
+    _scrollContainers() {
+      const sel = (this.adapter && this.adapter.container)
+        || '.catalog-scroll, .video-catalog-scroll, .el-scrollbar__wrap, [class*="catalog"], [class*="Catalog"], .chapter-list, .course-catalog';
+      return Array.from(document.querySelectorAll(sel))
+        .filter((el) => el.scrollHeight > el.clientHeight + 4);
+    },
+
+    /**
+     * 触发目录的虚拟滚动/懒加载，把「还没滚到视口、不在 DOM 里」的课时加载出来。
+     *
+     * 【round-5 修复 · 对应「不能跳转下一集」候选根因】
+     * 之前 findNext / breakdown 只基于「当前已渲染的 DOM 快照」查找。智慧树部分课程
+     * 目录是虚拟滚动：未滚动到的课时根本不在 DOM 里，于是 findNext 永远找不到后面的
+     * 未完成节，表现就是「点了下一节也没用 / 不能自动跳下一集」。
+     *
+     * 做法：对可滚动容器反复滚到底部，触发平台分批渲染；每滚一次重新统计条目数，
+     * 直到不再增长（到底或静态目录）为止。用 _catalogLoaded / _loadAttempts 双重闸门，
+     * 避免异步渲染漏抓后永久关闭补全，也防止无限抖动。
+     */
+    ensureCatalogLoaded() {
+      // round-35 修正：原来 `_catalogLoaded` 一旦为真就永久跳过，且首轮页面未就绪
+      // （_loadAttempts 第一次就 !grew）会直接锁死 → 虚拟滚动后面的未学节永远补不出来，
+      // 表现就是「跳不到没学过的地方」。现改为：必须「连续两次 no-growth」才视为稳定，
+      // 否则保持解锁下次继续补全；并加安全上限防止死循环。
+      if (this._catalogStable) return;
+      this._loadAttempts = (this._loadAttempts || 0) + 1;
+      if (this._loadAttempts > 14) { this._latchCatalog(); return; }  // 安全上限
+      const beforeTotal = this.items().length;
+      const boxes = this._scrollContainers();
+      // 没有可滚动容器 = 没有虚拟滚动可补全（含 jsdom 无布局环境）→ 直接视为加载完成
+      if (boxes.length === 0) { this._latchCatalog(); return; }
+      let grew = false;
+      for (const box of boxes) {
+        let guard = 0;
+        while (guard++ < 80) {
+          const before = this.items().length;
+          // 往复滚动，制造多次 scroll 事件以触发分批异步渲染
+          try {
+            box.scrollTop = box.scrollHeight;
+            box.scrollTop = Math.max(0, box.scrollHeight - box.clientHeight - 1);
+            box.scrollTop = box.scrollHeight;
+          } catch (e) { /* 某些环境 scrollTop 只读，忽略 */ }
+          const after = this.items().length;
+          if (after > before) grew = true;
+          else break;  // 不再增长 → 到底或静态，停止本轮
+        }
+      }
+      if (this.items().length > beforeTotal) grew = true;
+      if (grew) {
+        this._stableCount = 0;
+        this._catalogStable = false;   // 还有增长 → 下次继续补全
+        this._catalogLoaded = false;
+        ZHS.Log.info('虚拟滚动目录已触发懒加载，目录条目已补全');
+      } else {
+        this._stableCount = (this._stableCount || 0) + 1;
+        if (this._stableCount >= 2) this._latchCatalog();  // 连续两次稳定才锁
+      }
+    },
+
+    /** 标记目录加载完成：_catalogLoaded（旧字段，兼容既有断言/调用）与 _catalogStable（round-35）同步置真 */
+    _latchCatalog() {
+      this._catalogLoaded = true;
+      this._catalogStable = true;
+    },
+
+    /**
+     * round-35：异步版——虚拟滚动多为异步渲染（rAF/setTimeout），同步滚动读不到新节点。
+     * 调度器等异步路径在 findNext 前 await 它，给平台时间把目录全加载出来，
+     * 否则未学节还在 DOM 外就被判「没有下一节」。
+     * @returns {Promise<number>} 加载后的目录条目数
+     */
+    async ensureCatalogLoadedAsync() {
+      this._catalogStable = false;
+      this._stableCount = 0;
+      this._loadAttempts = 0;
+      for (let i = 0; i < 8; i++) {
+        this.ensureCatalogLoaded();
+        if (U && U.sleep) await U.sleep(400); else await new Promise((r) => setTimeout(r, 400));
+        if (this._catalogStable) break;
+      }
+      return this.items().length;
+    },
+
+    /** 切课 / SPA 重载后清空目录加载缓存，下一门课重新触发懒加载 */
+    resetCatalogCache() {
+      this._catalogLoaded = false;
+      this._catalogStable = false;
+      this._stableCount = 0;
+      this._loadAttempts = 0;
+      this._sniffed = false;
+    },
+
+    stats() {
+      this.ensureCatalogLoaded();   // 补全虚拟滚动目录，进度统计才准确
+      const all = this.items();
+      const done = all.filter((el) => this.isFinished(el)).length;
+      return { total: all.length, done, percent: all.length ? Math.round((done / all.length) * 100) : 0 };
+    },
+
+    /**
+     * round-34【检测健康自检】—— 识别置信度探针。
+     *
+     * 为什么需要：detect() 是「评分选举」而非硬路由，平台一改版就可能选错适配器，
+     * 导致 items() 返回空 / 全是空壳 / 标题读不到。这时 breakdown 的 done/undone 全是 0，
+     * 上层若直接拿 `undone === 0` 当「全部看完」就会**误停**（见 trulyAllDone 的交叉校验）。
+     * 这里独立给出「这次识别到底靠不靠谱」的结论，供 trulyAllDone / 看门狗判断。
+     *
+     * @returns {{ adapter:string, itemCount:number, titledCount:number, hasActive:boolean, confidence:'low'|'mid'|'high' }}
+     *   confidence:
+     *     low  —— 空目录或读不到任何标题（识别基本失败，结论不可信）
+     *     mid  —— 有条目有标题但定位不到「当前项」（可能进了播放页但适配器没对上）
+     *     high —— 有条目、有标题、且能定位当前项（识别可靠）
+     */
+    diagnose() {
+      const items = this.items();
+      const itemCount = items.length;
+      let titledCount = 0;
+      for (const el of items) {
+        const t = this.itemTitle(el);
+        if (t && t.length >= 2) titledCount++;
+      }
+      const cur = this.current();
+      const hasActive = !!cur;
+      let confidence = 'low';
+      if (itemCount > 0 && titledCount > 0) {
+        // 能定位当前项 → 高置信；否则只要不止一个可读标题也视为中（排除了纯空壳）
+        confidence = (hasActive || titledCount > 1) ? 'high' : 'mid';
+      }
+      return { adapter: this.adapter.name, itemCount, titledCount, hasActive, confidence };
+    },
+
+    /**
+     * round-34【完成态交叉校验】—— 比 breakdown().allDone 更严格，专门堵「误判全部看完」的假停摆。
+     *
+     * 常规口径：`total > 0 && undone === 0` 即 allDone。但这条在两种情况下会坑人：
+     *   ① 检测层返回空/错目录 → undone 恒为 0 → 谎报全看完，脚本停在假完成；
+     *   ② 当前视频还在播（进度远未到完成线 91%），但目录侧某次快照把本节点判成了 done
+     *      → undone 瞬时为 0 → 触发 finishAll，实则那一节根本没看完。
+     *
+     * 因此真正「全部看完」必须同时满足：
+     *   1. breakdown 常规口径通过；
+     *   2. 目录识别置信度非 low（否则空目录不能当全看完）；
+     *   3. 当前若有视频在播，其进度必须已到完成线（否则仍有未完成课时）。
+     * 任一不满足都返回 false，交由上层走「定位失败 / 瞬时故障」分支而非「达标停」。
+     */
+    trulyAllDone() {
+      const bd = this.breakdown();
+      if (!(bd.total > 0 && bd.undone === 0)) return false;   // 常规口径不过，直接 false
+
+      // 交叉校验①：识别置信度必须够高，否则空/错目录极易误判
+      const d = this.diagnose();
+      if (d.confidence === 'low') {
+        ZHS.Log.warn('[防误停] 目录识别置信度低（adapter=' + d.adapter
+          + '，itemCount=' + d.itemCount + '，titled=' + d.titledCount
+          + '），不急于判定全部看完');
+        return false;
+      }
+
+      // 交叉校验②：当前还有视频在播且进度远未到完成线 → 仍有未完成课时，不能停
+      try {
+        const v = (ZHS.Player && ZHS.Player.video) ? ZHS.Player.video() : null;
+        if (v && ZHS.Player.hasValidDuration && ZHS.Player.hasValidDuration(v)) {
+          const pct = ZHS.Player.percent(v);
+          const FINISH_PCT = (ZHS.Const && ZHS.Const.FINISH_PCT) || 91;
+          if (pct > 0 && pct < FINISH_PCT) {
+            ZHS.Log.warn('[防误停] 当前视频进度仅 ' + pct + '%，仍属未完成课时，不判定全部看完');
+            return false;
+          }
+        }
+      } catch (e) { /* 播放器不可用不影响主判据 */ }
+      return true;
+    },
+  };
+
+  ZHS.Catalog = Catalog;
+  ZHS.STATUS = STATUS;
+})();
+
+/* ===== 02d-guard.js ===== */
+/**
+ * 全局防卡死看门狗（round-34）
+ *
+ * 解决「整体无进展、但各单点触发器都没命中」的盲区 —— 这是「希望不要被卡住」的最后一道防线。
+ *
+ * 现有单点防护（已存在）：
+ *   · Player.checkStall        —— 视频 currentTime 120s 不推进 → 唤醒
+ *   · ZERO_PROGRESS_GIVEUP_MS  —— 平台进度持续 0% 超 3min → 停手交人
+ *   · pendingHop 看门狗        —— 课程中心进入请求 5min 未落地 → 标失败
+ *   · tryResumeAfterTransientStop —— DOM 变化后瞬时故障自愈
+ *
+ * 但仍有盲区：
+ *   · 检测层返回空/错目录 → breakdown 误报 allDone → 看似「正常结束」，实则卡在假完成；
+ *   · 视频被平台缓冲卡住、currentTime 不前进，但 checkStall 反复唤醒、视频又不是 0% → 两端都不触发；
+ *   · SPA 静默把目录节点换掉但 courseId 没变 → adapter 缓存陈旧，findNext 永远指向旧节点。
+ *
+ * 本模块：心跳每 HEARTBEAT_MS 采样一次「进展指纹」（已完成节数 + 当前视频进度 + currentTime），
+ * 指纹无变化即视为停滞。按停滞时长分四级逐级升级，每次升级都刷新基准避免重复升级：
+ *   T1（STUCK_T1）：重探测页面版本 + 清目录缓存（重新识别 / 补全虚拟滚动目录）；
+ *   T2（STUCK_T2）：强制续播唤醒（Player.ensurePlaying）+ 重新对账；
+ *   T3（STUCK_T3）：尝试跳到下一节（Scheduler.gotoNext）；
+ *   T4（STUCK_T4）：标记瞬时停摆交人（Scheduler.stop('transient')），绝不静默无限挂起。
+ *
+ * 设计约束（与测试/工程兼容）：
+ *   · 仅在 ZHS.state.running 时续排下一拍；停止后不残留定时器（否则 node 测试进程挂起）。
+ *   · 自身绝不抛错影响主流程；所有外部调用 try/catch 包裹。
+ *   · 由 Scheduler.start/stop 负责启停（见 05-scheduler.js），不在本模块自启动。
+ */
+(function () {
+  'use strict';
+  const ZHS = window.ZHS;
+  if (!ZHS || !ZHS.Util) return;
+  // 重入守卫：SPA 二次注入时整个模块直接退出，避免定时器叠加
+  if (ZHS.__mod02d_guard) return;
+  ZHS.__mod02d_guard = true;
+
+  const HEARTBEAT_MS = 60000;          // 心跳间隔
+  const STUCK_T1 = 4 * 60 * 1000;     // 4 分钟无进展 → 重探测
+  const STUCK_T2 = 8 * 60 * 1000;     // 8 分钟 → 唤醒续播
+  const STUCK_T3 = 12 * 60 * 1000;    // 12 分钟 → 跳下一节
+  const STUCK_T4 = 16 * 60 * 1000;    // 16 分钟 → 交人
+
+  const Guard = {
+    _timer: null,
+    _lastProgressAt: 0,
+    _fp: null,            // 上一次进展指纹
+    _tier: 0,             // 已升到的级别（0=未升级），避免同级别重复升级
+
+    start() {
+      if (this._timer) return;
+      this._lastProgressAt = Date.now();
+      this._fp = null;
+      this._tier = 0;
+      this._loop();
+    },
+
+    stop() {
+      if (this._timer) { clearTimeout(this._timer); this._timer = null; }
+    },
+
+    _loop() {
+      // 自调度：仅当主循环仍在运行时续排下一拍；停止后不残留定时器
+      this._timer = setTimeout(() => {
+        try { this._tick(); } catch (e) { /* 看门狗自身绝不能抛错 */ }
+        if (ZHS.state && ZHS.state.running) this._loop();
+        else this._timer = null;
+      }, HEARTBEAT_MS);
+    },
+
+    /** 采样进展指纹：已完成节数 + 当前视频进度 + currentTime */
+    _sample() {
+      let done = -1, pct = -1, cur = -1;
+      try {
+        const cat = ZHS.Catalog;
+        if (cat && cat.stats) done = cat.stats().done;
+      } catch (e) { done = -1; }
+      try {
+        const v = (ZHS.Player && ZHS.Player.video) ? ZHS.Player.video() : null;
+        if (v) { pct = ZHS.Player.percent(v); cur = Math.round(v.currentTime || 0); }
+      } catch (e) { /* 忽略 */ }
+      return done + '#' + pct + '#' + cur;
+    },
+
+    _tick() {
+      if (!ZHS.state || !ZHS.state.running) return;
+      const fp = this._sample();
+      const now = Date.now();
+      // 指纹变化 → 确有进展，刷新基准并复位升级级别
+      if (fp !== this._fp) {
+        this._fp = fp;
+        this._lastProgressAt = now;
+        this._tier = 0;
+        return;
+      }
+      const stuck = now - this._lastProgressAt;
+      if (stuck < STUCK_T1) return;     // 还没到第一级，继续观察
+
+      // —— 逐级升级，每级只触发一次（靠 _tier 防重）；升级后给本级别一段观察窗口 ——
+      if (this._tier < 1 && stuck >= STUCK_T1) {
+        this._tier = 1;
+        this._lastProgressAt = now;
+        ZHS.Log.warn('[防卡死 T1] 已 ' + Math.round(stuck / 1000) + 's 无进展，重新探测页面版本并清目录缓存');
+        try { if (ZHS.Catalog && ZHS.Catalog.redetect) ZHS.Catalog.redetect(); } catch (e) {}
+        try { if (ZHS.Catalog && ZHS.Catalog.resetCatalogCache) ZHS.Catalog.resetCatalogCache(); } catch (e) {}
+        return;
+      }
+      if (this._tier < 2 && stuck >= STUCK_T2) {
+        this._tier = 2;
+        this._lastProgressAt = now;
+        ZHS.Log.warn('[防卡死 T2] 已 ' + Math.round(stuck / 1000) + 's 无进展，强制唤醒续播');
+        try {
+          const v = (ZHS.Player && ZHS.Player.video) ? ZHS.Player.video() : null;
+          if (v && ZHS.Player.ensurePlaying) ZHS.Player.ensurePlaying(v);
+          if (ZHS.Player && ZHS.Player.resetSync) ZHS.Player.resetSync();
+        } catch (e) {}
+        return;
+      }
+      if (this._tier < 3 && stuck >= STUCK_T3) {
+        this._tier = 3;
+        this._lastProgressAt = now;
+        ZHS.Log.warn('[防卡死 T3] 已 ' + Math.round(stuck / 1000) + 's 无进展，尝试跳到下一节');
+        try { if (ZHS.Scheduler && ZHS.Scheduler.gotoNext) ZHS.Scheduler.gotoNext('guard', { manual: true }); } catch (e) {}
+        return;
+      }
+      if (this._tier < 4 && stuck >= STUCK_T4) {
+        this._tier = 4;
+        this._lastProgressAt = now;
+        ZHS.Log.error('[防卡死 T4] 已 ' + Math.round(stuck / 1000) + 's 无任何进展，标记瞬时停摆交人处理（不再静默挂起）');
+        try { if (ZHS.Scheduler && ZHS.Scheduler.stop) ZHS.Scheduler.stop('transient'); } catch (e) {}
+        return;
+      }
+    },
+  };
+
+  ZHS.Guard = Guard;
+})();
+
+/* ===== 02e-nav.js ===== */
+(function () {
+  'use strict';
+  const ZHS = window.ZHS = window.ZHS || {};
+  const U = ZHS.Util;
+
+  /**
+   * round-35：导航策略链（取代单一「合成点击下一节」通道）
+   *
+   * 背景：智慧树反作弊把 isTrusted=false 的 MouseEvent 判成脚本并踢人（round-26 还确认
+   * seek 拖进度会触发腾讯 Turing 滑块）。原 gotoNext 唯一点击通道是
+   * Catalog.click → el.click()/realClick（全合成事件），正是被检测的根。
+   *
+   * 本模块把「跳到未学习节」拆成一篮子策略，按「隐蔽度」从高到低尝试，任一成功即收：
+   *   ① spa      —— 直接调 SPA 内部方法（Vue $emit / React onClick / 播放器 load），零 DOM 事件，最隐蔽
+   *   ② url      —— URL/hash 深链，浏览器原生导航（智慧树多数不支持，失败自动回落）
+   *   ③ humanClick —— 拟人化合成点击（最后兜底，仍合成但最难被判脚本）
+   *
+   * 验收原则：①/② 这类「无点击」策略本身不派发事件，必须用「目录当前项是否真的变成目标项」
+   * 来验收（_waitSwitched），绝不能靠 clickAndVerify（那会反过来再点一次，把①/② 的意义抹掉）。
+   * 只有③ 才走 clickAndVerify 去点击+验收。
+   */
+  const Nav = {
+    lastStrategy: null,
+    lastError: null,
+    _fromKey: null,
+
+    /**
+     * 跳转到目标目录条目（未学习节）。
+     * @param {Element} el 目标条目
+     * @param {object} [opt] { fromKey, timeout, humanOnly }
+     * @returns {Promise<boolean>} 是否成功切过去
+     */
+    async jumpTo(el, opt) {
+      opt = opt || {};
+      this._fromKey = opt.fromKey || null;
+      if (!el) return false;
+      const cat = ZHS.Catalog;
+
+      // 先试「无点击」策略：spa → url
+      if (!opt.humanOnly) {
+        for (const name of ['spa', 'url']) {
+          try {
+            const fired = await (name === 'spa' ? this._viaSpa(el) : this._viaUrl(el));
+            if (!fired) continue;                         // 该策略不适用（如没找到 SPA 句柄）→ 试下一个
+            if (await this._waitSwitched(el, opt.fromKey, opt.timeout || 2500)) {
+              this.lastStrategy = name;
+              ZHS.Log.info('[Nav] 策略『' + name + '』跳转成功并验收');
+              return true;
+            }
+          } catch (e) {
+            this.lastError = name + ': ' + e.message;
+            ZHS.Log.debug('[Nav] 策略『' + name + '』异常：' + e.message);
+          }
+        }
+      }
+
+      // 策略③：平台原生下一节/继续按钮（仅 gotoNext 场景允许）
+      if (opt.allowNativeNext) {
+        try {
+          const fired = await this._viaNativeNext();
+          if (fired && await this._waitSwitched(el, opt.fromKey, opt.timeout || 2500)) {
+            this.lastStrategy = 'nativeNext';
+            ZHS.Log.info('[Nav] 策略『nativeNext』跳转成功并验收');
+            return true;
+          }
+        } catch (e) {
+          this.lastError = 'nativeNext: ' + e.message;
+        }
+      }
+
+      // 回落：拟人化点击（唯一会派发事件的策略）
+      try {
+        const ok = (cat && cat.clickAndVerify)
+          ? await cat.clickAndVerify(el, { timeout: opt.timeout || 3000, tries: 2, fromKey: opt.fromKey })
+          : this._legacyClick(el);
+        if (ok) { this.lastStrategy = 'humanClick'; return true; }
+      } catch (e) {
+        this.lastError = 'humanClick: ' + e.message;
+      }
+      ZHS.Log.warn('[Nav] 所有跳转策略均失败（lastError=' + (this.lastError || 'n/a') + '）');
+      return false;
+    },
+
+    /**
+     * 策略③：平台原生「下一节/下一集/继续学习」按钮（round-36，用户明确要求「用平台本身的按钮指令」）。
+     * 只在 gotoNext 场景开启（opt.allowNativeNext）——它按「下一节」推进，不保证等于任意指定目标 el，
+     * 但 gotoNext 的 next 本就是下一节，语义吻合；其它场景（续播定位到指定节）不启用，交给验收兜底。
+     */
+    async _viaNativeNext() {
+      const kw = /下一节|下一集|下一课时|下一个|继续学习|继续播放|继续课程|继 *续/;
+      const visible = (elm) => {
+        try { const s = getComputedStyle(elm); return s.display !== 'none' && s.visibility !== 'hidden'; }
+        catch (e) { return true; }
+      };
+      const els = Array.from(document.querySelectorAll('button,[role="button"],a,li,div,span,i')).filter((elm) => {
+        const t = (elm.textContent || '').replace(/\s+/g, '').trim();
+        if (!t || t.length > 10 || !kw.test(t)) return false;
+        return visible(elm);
+      });
+      if (!els.length) return false;
+      els.sort((a, b) => (b.tagName === 'BUTTON' ? 1 : 0) - (a.tagName === 'BUTTON' ? 1 : 0));  // 按钮类优先
+      const btn = els[0];
+      const fire = U.realClickHuman || ((x) => { x.click(); return true; });
+      return fire(btn);
+    },
+
+    /**
+     * 验收：目录当前项是否已变成目标项（不派发任何事件）。
+     * 逻辑等价于 Catalog.clickAndVerify 内部的 nowIsTarget：用元素身份/目录索引比对，
+     * 标题同名也能靠索引区分；都没法判断时回落标题比对。
+     */
+    async _waitSwitched(el, fromKey, ms) {
+      const cat = ZHS.Catalog;
+      if (!cat || !cat.items || !cat.current) return false;
+      const deadline = Date.now() + (ms || 2500);
+      const step = () => {
+        try {
+          const list = cat.items();
+          const cur = cat.current();
+          if (!cur) return false;
+          const _idx = (n) => list.findIndex((it) => it === n || it.contains(n) || (n && n.contains && n.contains(it)));
+          const curIdx = _idx(cur);
+          const tgtIdx = _idx(el);
+          if (curIdx >= 0 && tgtIdx >= 0) {
+            if (curIdx === tgtIdx) return true;
+            if (fromKey && curIdx === _idx(cat.findByName(fromKey)) && curIdx !== tgtIdx) return false;
+            return false;
+          }
+          const ck = cat.itemTitle(cur), tk = cat.itemTitle(el);
+          if (!ck) return false;
+          if (fromKey && ck === fromKey && ck !== tk) return false;
+          return ck === tk;
+        } catch (e) { return false; }
+      };
+      while (Date.now() < deadline) {
+        if (step()) return true;
+        if (U && U.sleep) await U.sleep(150); else await new Promise((r) => setTimeout(r, 150));
+      }
+      return step();
+    },
+
+    /** 策略①：SPA 内部方法直调（无合成事件，最隐蔽） */
+    async _viaSpa(el) {
+      if (!el) return false;
+
+      // —— Vue2/3 组件实例：直接触发其 click 处理函数（绕开 DOM 事件分发）——
+      const vm = el.__vue__ || el.__vueParentComponent;
+      if (vm) {
+        const ctx = vm.ctx || vm.proxy || vm;
+        // 直接 emit click：Vue 会把事件交给组件绑定的 @click 处理器，等价于真实点击但无 DOM 事件
+        if (typeof vm.$emit === 'function') {
+          try { vm.$emit('click', { currentTarget: el, target: el, preventDefault() {}, stopPropagation() {} }); return true; }
+          catch (e) { /* 忽略，继续尝试其它 */ }
+        }
+        const m = ['select', 'onClick', 'handleClick', 'goToLesson', 'playLesson', 'clickItem', 'onItemClick'];
+        for (const name of m) {
+          const fn = ctx && ctx[name];
+          if (typeof fn === 'function') {
+            try { fn.call(ctx, { currentTarget: el, target: el }); return true; } catch (e) { /* 忽略 */ }
+          }
+        }
+      }
+
+      // —— React fiber：直接调 props.onClick ——
+      const fiber = this._reactFiber(el);
+      if (fiber) {
+        const props = (fiber.memoizedProps) || (fiber.stateNode && fiber.stateNode.props) || {};
+        if (typeof props.onClick === 'function') {
+          try {
+            props.onClick({ currentTarget: el, target: el, preventDefault() {}, stopPropagation() {} });
+            return true;
+          } catch (e) { /* 忽略 */ }
+        }
+      }
+
+      // —— 全局播放器对象（部分播放器 SDK 暴露 load(lessonId)）——
+      const player = window.__player || window.player || (window.videojs && window.videojs.getPlayers && window.videojs.getPlayers());
+      if (player && typeof player.load === 'function') {
+        const id = this._lessonId(el);
+        if (id) { try { player.load(id); return true; } catch (e) { /* 忽略 */ } }
+      }
+      return false;   // 没有可用句柄 → 交给 url / humanClick
+    },
+
+    /** 策略②：URL / hash 深链（浏览器原生导航；智慧树多数不支持，失败自动回落） */
+    async _viaUrl(el) {
+      const href = this._lessonHref(el);
+      if (!href) return false;
+      try {
+        if (href.charAt(0) === '#') {
+          if (location.hash !== href) location.hash = href;
+        } else if (/^https?:/i.test(href)) {
+          location.assign(href);
+        } else {
+          location.assign(new URL(href, location.href).href);
+        }
+        return true;
+      } catch (e) { return false; }
+    },
+
+    /** 兜底（无 clickAndVerify 时）：裸 click */
+    _legacyClick(el) {
+      try { if (el.scrollIntoView) el.scrollIntoView({ block: 'center' }); } catch (e) {}
+      try { el.click(); return true; } catch (e) { return false; }
+    },
+
+    // —— 辅助：从元素抽取课时 id / href / SPA 句柄 ——
+    _lessonId(el) {
+      if (!el || !el.getAttribute) return null;
+      for (const a of ['data-lesson-id', 'data-id', 'data-course-id', 'data-vid', 'data-lessonid', 'lessonid']) {
+        const v = el.getAttribute(a);
+        if (v) return v;
+      }
+      const link = (el.querySelector && el.querySelector('a[href]'));
+      if (link) {
+        const m = String(link.getAttribute('href') || '').match(/id=([^&]+)/);
+        if (m) return m[1];
+      }
+      return null;
+    },
+    _lessonHref(el) {
+      const a = (el.querySelector && el.querySelector('a[href]'));
+      if (a) { const h = a.getAttribute('href'); if (h && h !== '#' && !/^javascript:/i.test(h)) return h; }
+      const v = this._lessonId(el);
+      return v ? ('#lesson-' + v) : null;
+    },
+    _reactFiber(el) {
+      for (const k of Object.keys(el)) {
+        if (/^__reactFiber\$/.test(k) || /^__reactInternalInstance\$/.test(k)) return el[k];
+      }
+      return null;
+    },
+  };
+
+  ZHS.Nav = Nav;
+})();
+
+/* ===== 03-player.js ===== */
+/**
+ * 播放层：视频控制（静音、倍速、防暂停、进度回退重试）
+ */
+(function () {
+  'use strict';
+  const ZHS = window.ZHS;
+  if (!ZHS || !ZHS.Util) return;
+  // 重入守卫：SPA 二次注入时整个模块直接退出，避免定时器/监听器叠加
+  if (ZHS.__mod03_player) return;
+  ZHS.__mod03_player = true;
+  const U = ZHS.Util;
+
+  // 结尾判定阈值：播放到 99.5% 就算结束
+  const END_RATIO = 0.995;
+  // 播放卡死阈值：120 秒 currentTime 不推进就判定卡住
+  const STALL_MS = 120000;
+  // 进度对账容差：播放器超前平台记录超过这个秒数就拉回（Autovisor learn_lesson 同值）
+  const SYNC_LEAD_SECONDS = 15;
+
+  const Player = {
+    _lastTime: -1,
+    _lastActiveAt: Date.now(),
+    _retryCount: 0,
+    _syncedKey: null,        // 已对过账的课时标识（避免同一节内反复 seek）
+    // round-45：拟人化随机暂停状态。
+    // _humanPauseUntil = 本次「模拟离座」的截止时间戳（0 = 不在暂停期）；
+    // _humanPauseLastMs 记录上一次暂停了多久（恢复播报用）；
+    // _humanPauseResumeLogged 保证「回来了」只播报一次。
+    _humanPauseUntil: 0,
+    _humanPauseLastMs: 0,
+    _humanPauseResumeLogged: true,
+
+    /** 取当前 video 元素（缓存 + 校验是否还在文档里；顶层找不到再查同域 iframe） */
+    video() {
+      const cached = ZHS.state.videoEl;
+      if (cached && document.contains(cached)) return cached;
+      let v = document.querySelector('video');
+      if (!v && ZHS.Util.findVideoInIframes) v = ZHS.Util.findVideoInIframes(document);
+      if (v) ZHS.state.videoEl = v;
+      return v;
+    },
+
+    /** duration 是否有效 */
+    hasValidDuration(v) {
+      if (!v) return false;
+      return Number.isFinite(v.duration) && v.duration > 0;
+    },
+
+    /** 是否播放到结尾 */
+    atEnd(v) {
+      if (!v) return false;
+      if (v.ended) return true;
+      if (!this.hasValidDuration(v)) return false;
+      return v.currentTime / v.duration >= END_RATIO;
+    },
+
+    /** 当前进度百分比 */
+    percent(v) {
+      if (!this.hasValidDuration(v)) return 0;
+      return Math.min(100, Math.round((v.currentTime / v.duration) * 100));
+    },
+
+    /** 静音（volume=0 比 muted 属性更稳，平台会重置 muted） */
+    mute(v) {
+      if (!v) return;
+      try {
+        v.volume = 0;
+        v.muted = true;
+        const box = document.querySelector('.volumeBox');
+        if (box) box.classList.add('volumeNone');
+      } catch (e) { /* 忽略 */ }
+    },
+
+    /** 设置倍速（硬上限 1.5 —— 与 00-config.js 的配置钳位保持同一数值） */
+    setSpeed(v, speed) {
+      if (!v) return;
+      const s = Math.min(Math.max(Number(speed) || 1, 0.5), 1.5);
+      try {
+        if (Math.abs(v.playbackRate - s) > 0.01) v.playbackRate = s;
+        // 同步 UI，避免平台检测播放器倍速与界面不一致
+        const span = document.querySelector('.speedBox span');
+        if (span) span.innerText = 'X ' + s;
+      } catch (e) { /* 忽略 */ }
+    },
+
+    /**
+     * 确保播放：暂停且未结束 → 尝试恢复
+     * 返回是否触发了播放
+     */
+    async ensurePlaying(v) {
+      if (!v || v.ended) return false;
+      // round-45：拟人化暂停期内绝不唤醒 —— 这是「模拟真人离开」，
+      // 唤醒它等于把最像人的一段节奏亲手毁掉。到期由下一轮自然恢复。
+      if (this.isHumanPausing()) return false;
+      if (!v.paused) { this._markActive(v); return false; }
+      if (!this.hasValidDuration(v) && v.currentTime === 0) {
+        // 还没加载元数据，等一等
+        return false;
+      }
+      try {
+        this.mute(v);                       // 必须静音才能绕过自动播放策略
+        const p = v.play();
+        if (p && typeof p.catch === 'function') p.catch(() => {});
+        ZHS.Log.debug('检测到暂停，已尝试恢复播放');
+        return true;
+      } catch (e) {
+        ZHS.Log.debug('恢复播放失败：' + e.message);
+        return false;
+      }
+    },
+
+    /**
+     * 点击播放器的真实「播放」按钮（round-50，对应「再次选择播放」）。
+     *
+     * 为什么需要：智慧树部分课程用 prism-player / video.js / 腾讯云 txp 这类自定义播放器，
+     * 弹题关闭后直接调裸 video.play() 常被播放器内部状态拦截（或要求真实用户手势），
+     * 表现为「视频没真播起来、却已记成已恢复」。点击控件自身的播放按钮能绕开这个拦截，
+     * 让「检测在不在播放 → 没播就再点一次」闭环成立。
+     *
+     * 安全约束：
+     *   · 仅当 video 处于暂停态才点（播放按钮是切换键，已播放时点击反而暂停）；
+     *   · 全程防御性 try/catch + 存在性/可见性判断，找不到按钮就静默返回 false，
+     *     交给裸 video.play() 兜底，绝不让本函数抛错影响主流程；
+     *   · 跨域 iframe 内的播放按钮 querySelector 取不到，此时本函数自然返回 false，
+     *     由裸 video.play() 在同一 iframe 内兜底（跨域则无解，与旧行为一致）。
+     *
+     * @returns {boolean} 是否找到了可见播放按钮并点击
+     */
+    clickPlayButton(v) {
+      if (!v || !v.paused) return false;   // 已在播或非法 → 不点（避免切换成暂停）
+      try {
+        // 播放器容器优先级：video 的祖先播放器壳 > document
+        const host = (v.closest && v.closest(
+          '.prism-player, .video-js, .txp-wrapper, .txp-video-container, .player, .playBox, .video-container, .prism-player-wraper'
+        )) || document;
+        const SELS = [
+          '.prism-play-btn', '.prism-big-play-btn',                 // 阿里云 / Polyv prism
+          '.vjs-play-control', '.vjs-big-play-button',              // video.js
+          '.txp-button-play', '.txp_play',                          // 腾讯云 txp
+          '[class*="playBtn"]', '[class*="play-btn"]', '[class*="playButton"]',
+          'button[aria-label*="播放"]', 'button[title*="播放"]',
+          '.play-button', '.btn-play',                              // 通用
+        ];
+        for (const s of SELS) {
+          try {
+            const btns = host.querySelectorAll(s);
+            for (const b of btns) {
+              // 只点布局可见的按钮（big-play 在已播态常被隐藏，点了无效）
+              if (b && b.offsetParent !== null) {
+                b.click();
+                ZHS.Log.debug('已点击播放器播放按钮：' + s);
+                return true;
+              }
+            }
+          } catch (e) { /* 单选择器失败不影响其它 */ }
+        }
+        // 文本兜底：容器内唯一的「播放 / 开始 / ▶」按钮
+        try {
+          const txt = (el) => (el.innerText || el.textContent || '').replace(/\s+/g, '');
+          const byText = Array.from(host.querySelectorAll(
+            'button, [role="button"], .el-button, .btn, [class*="play"]'
+          )).find((b) => /^(播放|开始|▶|►)$/.test(txt(b)) && b.offsetParent !== null);
+          if (byText) { byText.click(); ZHS.Log.debug('已点击播放按钮（文本匹配）'); return true; }
+        } catch (e) { /* 忽略 */ }
+        return false;
+      } catch (e) {
+        ZHS.Log.debug('clickPlayButton 异常：' + e.message);
+        return false;
+      }
+    },
+
+    /** 检查是否卡死（currentTime 长时间不推进） */
+    checkStall(v) {
+      if (!v) return false;
+      if (v.paused) return false;
+      if (v.currentTime > this._lastTime + 0.25) {
+        this._lastTime = v.currentTime;
+        this._lastActiveAt = Date.now();
+        return false;
+      }
+      const idle = Date.now() - this._lastActiveAt;
+      if (idle >= STALL_MS) {
+        ZHS.Log.warn('视频 ' + Math.round(idle / 1000) + ' 秒未推进，尝试唤醒');
+        this._lastActiveAt = Date.now();
+        try { v.play(); } catch (e) { /* 忽略 */ }
+        return true;
+      }
+      return false;
+    },
+
+    /**
+     * 播放器进度对账（2026-10-06 新增，参考 Autovisor learn_lesson 的「进度对齐」）
+     *
+     * 为什么需要：平台按「已学百分比」异步上报。播放器如果跑在平台记录的前面太多，
+     * 中途一旦断线、弹验证、弹题，超出记录的那一段就等于白播——平台不认。
+     * 极端情形是人机验证没通过时进度直接作废归零，此时播放器还傻跑在前面。
+     *
+     * 对账策略（照抄 Autovisor 的克制做法，**不是**持续对账）：
+     *   · 同一节课只对一次账，避免反复干预造成卡顿/花屏；
+     *     （round-26：这里曾经真的 seek 拉回播放位置，真机证明 seek 会触发
+     *       腾讯滑块验证码，现已去掉，见函数内注释）
+     *   · 平台进度读不到（0%）时不干预——刚打开一节时进度天然是 0，
+     *     一拉回就会变成「重播开头 20 秒」的死循环；这种情况交给调度器的
+     *     0% 停滞守卫（ZERO_PROGRESS_GIVEUP_MS）去停手交人；
+     *   · 验证/弹题结束后由调度器调 resetSync() 清标记，恢复时重新对一次账。
+     *
+     * @returns {boolean} 是否真的拉回过
+     */
+    syncToCatalog(v, lessonKey) {
+      if (!v || !lessonKey || this._syncedKey === lessonKey) return false;
+      if (!Number.isFinite(v.duration) || v.duration <= 0) return false;
+      // round-48：暂停期（含拟人暂停 / 弹题暂停 / AI 随堂练习暂停）不比对进度。
+      // 契约：暂停态进度比对无意义，且可能埋下「将来有人加『落后也 seek 拉回』逻辑
+      // 却在暂停期触发 → 命中腾讯 Turing 滑块」的回归隐患（见本文件上方 round-26 铁律）。
+      // 提前 return 把「暂停期不干预播放位置」显式钉死，与 checkStall 的 paused 早退一致。
+      if (v.paused) return false;
+      const cur = ZHS.Catalog && ZHS.Catalog.current ? ZHS.Catalog.current() : null;
+      if (!cur) return false;
+      const pct = ZHS.Catalog.progressOf(cur);
+      this._syncedKey = lessonKey;   // 无论是否拉回，本节不再重复对账
+      if (!(pct > 0)) return false;
+      const expected = Math.floor(v.duration * pct / 100);
+      if (v.currentTime > expected + SYNC_LEAD_SECONDS) {
+        // 【2026-10-19 round-26 修订】这里原先是 `v.currentTime = expected`（seek 拉回）。
+        //
+        // 真机结论：智慧树把「异常 seek / 拖进度条」当作脚本特征 —— 一 seek 就弹
+        // 腾讯 Turing 滑块验证码（turing.captcha.gtimg.com 跨域 iframe，脚本解不了）。
+        // 这正是用户反馈的「有的下一集被检测成脚本、跳转不支持」的根因。
+        //
+        // 所以这里改为只告警、绝不干预播放位置；真正的进度补齐走
+        // 「播完后重新加载本节」这条无 seek 路径（见 retryFromPlatformProgress）。
+        ZHS.Log.warn('播放器进度超前平台记录（播放器 ' + Math.round(v.currentTime)
+          + 's / 平台 ' + pct + '% ≈ ' + expected + 's）。按真机结论不 seek'
+          + '（seek 会触发滑块验证码），进度补齐交由播完后的「重新加载本节」处理。');
+      }
+      return false;
+    },
+
+    /** 清空对账标记：验证/弹题结束后需要重新对一次账 */
+    resetSync() {
+      this._syncedKey = null;
+    },
+
+    _markActive(v) {
+      if (v && v.currentTime > this._lastTime + 0.25) {
+        this._lastTime = v.currentTime;
+        this._lastActiveAt = Date.now();
+      }
+    },
+
+    /**
+     * 跳转到指定秒数并播放。
+     *
+     * ⚠️【round-26 铁律】这是全脚本**唯一**会产生 seek 的入口，**仅供用户手动操作**
+     * （例如面板上的「跳到某处」）。自动化链路 —— 进度对账、回退重播、断点续播 ——
+     * 一律不得调用：真机证明任何 seek 都会触发腾讯 Turing 滑块验证码，
+     * 而验证码一旦弹出，脚本解不了、进度还会作废。改动前请先看本文件上方的说明。
+     */
+    async seekTo(v, seconds) {
+      if (!v || !Number.isFinite(seconds)) return false;
+      try {
+        v.currentTime = Math.max(0, seconds);
+        v.play();
+        return true;
+      } catch (e) {
+        ZHS.Log.warn('跳转失败：' + e.message);
+        return false;
+      }
+    },
+
+    /**
+     * 进度不同步处理：视频放完但平台记录 <100%
+     *
+     * 【2026-10-19 round-26 重写：彻底去掉 seek】
+     *
+     * 旧实现：把 video.currentTime 拉回平台记录点重播。
+     * 真机结论：智慧树把「异常 seek / 拖进度条」当作脚本特征 —— 一 seek 就弹出
+     * 腾讯 Turing 滑块验证码（turing.captcha.gtimg.com 跨域 iframe，脚本解不了）。
+     * 这正是用户反馈的「有的下一集被检测成脚本、跳转不支持」的根因。
+     *
+     * 新实现走人类的做法：**重新点一次本节标题**。真机实测（2.25 节）：点未完成
+     * 小节的标题后，平台会按它自己记录的进度把视频定位到断点加载（474/622）——
+     * 全程不产生任何 seek 事件，却一样达到「从平台记录点续播补齐」的效果。
+     * 最多重试 2 次，仍不同步就交回上层跳下一节（不卡死）。
+     */
+    async retryFromPlatformProgress(v, platformPercent) {
+      if (this._retryCount >= 2) {
+        ZHS.Log.warn('进度不同步已重试 2 次仍失败，跳过本课时');
+        this._retryCount = 0;
+        return false;
+      }
+      // 0% 不在这里硬撑：多半是安全验证没过（此时进度一律作废，重播也没用），
+      // 交给调度器的「0% 停滞守卫」去停手交人。
+      if (!(platformPercent > 0) || platformPercent >= 100) return false;
+
+      const Catalog = ZHS.Catalog;
+      const cur = Catalog && Catalog.current ? Catalog.current() : null;
+      if (!cur || !Catalog.click) {
+        ZHS.Log.warn('定位不到当前课时，无法按平台进度重播，放弃本课时');
+        return false;
+      }
+      ZHS.Log.warn('视频已结束但平台仅记录 ' + platformPercent
+        + '%，重新加载本节按平台进度续播（第 ' + (this._retryCount + 1) + ' 次，不 seek）');
+      try { await ZHS.Nav.jumpTo(cur); } catch (e) { /* 跳转失败下一轮还会再判 */ }
+      this._retryCount++;
+      await U.sleep(3000);   // 等平台重新加载并把视频定位到它的记录点
+      return true;
+    },
+
+    resetRetry() { this._retryCount = 0; },
+
+    /** 是否处于「模拟真人离座」暂停期 */
+    isHumanPausing() {
+      return this._humanPauseUntil > 0 && Date.now() < this._humanPauseUntil;
+    },
+
+    /**
+     * 拟人化随机暂停（round-45，听课程拟人节奏的核心一环）
+     *
+     * 依据：pjm314159/zhs（协议逆向参考实现的官方客户端复刻）播放循环每轮有
+     * 0.25% 概率随机暂停 60 秒。真人看课本来就会中途离开，而机器挂机最显著的
+     * 特征就是「匀速不停」——补上与官方客户端同款的随机暂停，能把挂机特征
+     * 进一步拉向真人在看。
+     *
+     * 调用方（调度器主循环）每 2 秒调一次；本方法自己掷骰子，命中才暂停。
+     * 安全约束：
+     *   · 只在「正在播放」时触发（暂停中 / 已结束 / 无视频不触发）；
+     *   · 刚开播 10 秒内不暂停（真人也不会一坐下就走开）；
+     *   · 暂停期间 ensurePlaying 不唤醒、checkStall 不判卡死（paused 早退）、
+     *     学习时长不计（v.paused 天然不计），到期由主循环自然恢复播放；
+     *   · 切课冷却（NAV_COOLDOWN_MS）由调用方的调用位置保证 —— 冷却期内
+     *     主循环在到达本方法之前就 return 了。
+     *
+     * @returns {boolean} 是否本次触发了暂停
+     */
+    maybeHumanPause(video) {
+      const cfg = ZHS.config;
+      if (!cfg.humanPause) return false;
+      const now = Date.now();
+
+      // 暂停到期：播报一次「回来了」（实际恢复由 ensurePlaying 负责）
+      //
+      // 【round-46 修订】播报加「视频确实处于暂停」守卫。
+      // 端到端对账发现的交叉缺陷：暂停期内若弹题插入，_handleDialog 答完弹题后
+      // 会把视频恢复播放（video.play()），而 _humanPauseUntil 尚未到期。到期时
+      // 若无条件播报「模拟离座结束，恢复播放」，就是一条**假播报**——视频早就
+      // 在播了，「离座」期间实际在处理弹题，语义全错。因此只有视频确实还暂停着
+      // （即这次暂停真的是「模拟离座」造成的）才播报；视频已在播则静默清零状态。
+      // （弹题路径上的 resetHumanPause 是主修复，这里是双保险。）
+      if (this._humanPauseUntil && now >= this._humanPauseUntil) {
+        if (!this._humanPauseResumeLogged && video && video.paused) {
+          this._humanPauseResumeLogged = true;
+          ZHS.Log.info('模拟离座结束（暂停约 ' + Math.round(this._humanPauseLastMs / 1000) + ' 秒），恢复播放');
+        }
+        this._humanPauseUntil = 0;
+        return false;
+      }
+      if (this._humanPauseUntil) return false;        // 暂停中，不重复触发
+      if (!video || video.paused || video.ended) return false;
+      if (!this.hasValidDuration(video)) return false;
+      if (video.currentTime < 10) return false;       // 刚开播不暂停
+
+      const chance = Number(cfg.humanPauseChance);
+      if (!(chance > 0) || Math.random() >= chance) return false;
+
+      const min = Math.max(5, Number(cfg.humanPauseMinSec) || 30);
+      const max = Math.max(min, Number(cfg.humanPauseMaxSec) || 90);
+      const dur = Math.round(min + Math.random() * (max - min));
+      this._humanPauseLastMs = dur * 1000;
+      this._humanPauseUntil = now + dur * 1000;
+      this._humanPauseResumeLogged = false;
+      try { video.pause(); } catch (e) { /* 暂停失败不影响主流程 */ }
+      ZHS.Log.info('拟人化随机暂停：模拟真人中途离开，暂停 ' + dur + ' 秒后自动恢复'
+        + '（平台官方客户端同款节奏，降低挂机特征）');
+      return true;
+    },
+
+    /** 清除拟人暂停状态（切课/停机时调用，避免旧节的状态带到新节） */
+    resetHumanPause() {
+      this._humanPauseUntil = 0;
+      this._humanPauseResumeLogged = true;
+    },
+  };
+
+  ZHS.Player = Player;
+})();
+
+/* ===== 04-resume.js ===== */
+/**
+ * 续播层：断点记录与恢复
+ *
+ * 存储用 GM_setValue（跨 iframe/页面共享，持久化到磁盘），
+ * 无 GM 环境降级到 localStorage。
+ */
+(function () {
+  'use strict';
+  const ZHS = window.ZHS;
+  if (!ZHS || !ZHS.Util) return;
+  // 重入守卫：SPA 二次注入时整个模块直接退出，避免定时器/监听器叠加
+  if (ZHS.__mod04_resume) return;
+  ZHS.__mod04_resume = true;
+  const U = ZHS.Util;
+
+  const STORE_KEY = 'zhs-helper-resume';
+  const hasGM = typeof GM_setValue === 'function' && typeof GM_getValue === 'function';
+
+  function readStore() {
+    try {
+      const raw = hasGM ? GM_getValue(STORE_KEY, null) : localStorage.getItem(STORE_KEY);
+      if (!raw) return { courses: {} };
+      const obj = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      if (!obj || typeof obj !== 'object') return { courses: {} };
+      if (!obj.courses) obj.courses = {};
+      return obj;
+    } catch (e) {
+      ZHS.Log.warn('续播记录损坏，已重置');
+      return { courses: {} };
+    }
+  }
+
+  function writeStore(store) {
+    try {
+      const raw = JSON.stringify(store);
+      if (hasGM) GM_setValue(STORE_KEY, raw);
+      else localStorage.setItem(STORE_KEY, raw);
+      return true;
+    } catch (e) {
+      ZHS.Log.warn('续播记录写入失败：' + e.message);
+      return false;
+    }
+  }
+
+  const Resume = {
+    _saveThrottled: null,
+    _boundVideo: null,      // 当前绑定的 video 元素
+    _bindId: -1,            // 绑定序号：防止旧监听器写入
+    _bindSeq: 0,            // 自增计数器
+    _lastDuration: 0,       // 上次记录的时长，用于换源时的比例换算
+    _onTimeUpdate: null,
+    _onPause: null,
+    _onUnload: null,
+    _restored: false,
+
+    /** 保存当前进度（节流由调用方控制） */
+    save(courseId, lessonKey, time, duration) {
+      if (!courseId || !lessonKey) return;
+      if (!Number.isFinite(time) || time < 5) return;   // 前 5 秒不值得记
+      // 已接近结尾则不记（下次应从头或跳过）
+      if (Number.isFinite(duration) && duration > 0 && time > duration - 10) return;
+
+      const store = readStore();
+      store.courses[courseId] = {
+        lessonKey: lessonKey,
+        time: Math.round(time * 10) / 10,
+        duration: Number.isFinite(duration) ? Math.round(duration) : null,
+        updatedAt: Date.now(),
+        siteVersion: ZHS.state.siteVersion || 'unknown',
+      };
+      writeStore(store);
+    },
+
+    /** 读取某课程的记录（含过期清理） */
+    load(courseId) {
+      if (!courseId) return null;
+      const store = readStore();
+      const rec = store.courses[courseId];
+      if (!rec) return null;
+      const days = Number(ZHS.config.resumeExpireDays) || 7;
+      const ageDays = (Date.now() - (rec.updatedAt || 0)) / 86400000;
+      if (ageDays > days) {
+        ZHS.Log.info('续播记录已过期（' + Math.round(ageDays) + ' 天），忽略');
+        delete store.courses[courseId];
+        writeStore(store);
+        return null;
+      }
+      return rec;
+    },
+
+    /** 清除某课程记录 */
+    clear(courseId) {
+      const store = readStore();
+      if (store.courses[courseId]) {
+        delete store.courses[courseId];
+        writeStore(store);
+        ZHS.Log.info('已清除本课程的续播记录');
+      }
+    },
+
+    /** 清空所有记录 */
+    clearAll() {
+      writeStore({ courses: {} });
+      ZHS.Log.info('已清空全部续播记录');
+    },
+
+    /** 列出所有记录（面板用） */
+    list() {
+      const store = readStore();
+      return Object.entries(store.courses).map(([id, rec]) => Object.assign({ courseId: id }, rec));
+    },
+
+    /**
+     * 绑定 video：监听 timeupdate 定期保存
+     *
+     * 踩坑记录（真 bug，截屏测试抓出）：
+     *   早期版本把「构造节流函数」写在「已绑定就返回」这条守卫**之前**，
+     *   而 07-main 里 bindVideo 会被调用两次 —— 第二次调用虽然什么都没绑，
+     *   却把 this._saveThrottled 覆盖成了一个**没被任何事件触发的**新函数，
+     *   于是已经挂上的 timeupdate 监听器指向了那个死函数，进度永远存不下来。
+     *
+     * 现在的做法：
+     *   1. 守卫放最前面，重复调用立即返回，不产生任何副作用
+     *   2. 每次绑定存一个绑定 id，监听器回调只认「当前这一次」的绑定
+     *   3. 顺带支持 duration 变化时的按比例换算（换清晰度/换视频源场景）
+     */
+    bindVideo(video, courseId, lessonKey) {
+      if (!video || !courseId) return false;
+
+      // 守卫前置：同一 video + 同一课程 + 同一课时 → 无需重绑（保留进度记录，避免重复绑定覆盖节流函数）
+      if (this._boundVideo === video && this._boundCourse === courseId && this._boundLesson === lessonKey) return true;
+
+      // 解绑旧的：视频元素被换掉，或 SPA 复用同一节点但切了课/切了节（闭包里的课程/课时标识需刷新）
+      this._detach();
+      this._lastDuration = 0;   // 切课/切节：清零旧时长，避免把旧课的时长比例套到新课算出错误恢复位置
+
+      const bindId = ++this._bindSeq;
+      this._boundVideo = video;
+      this._bindId = bindId;
+
+      const saveNow = (reason) => {
+        if (bindId !== this._bindId) return;      // 已被后来的绑定取代
+        if (!ZHS.config.resume) return;
+        if (video.paused) return;
+        const t = video.currentTime;
+        const d = video.duration;
+        if (!Number.isFinite(t) || t < 5) return;
+        // duration 变了（换清晰度/换源）→ 把已记录的时间按比例换算，避免续播跳错位置
+        let saveT = t;
+        let saveD = d;
+        if (Number.isFinite(d) && d > 0 && this._lastDuration > 0 && Math.abs(d - this._lastDuration) > 5) {
+          const ratio = t / d;
+          saveT = Math.round(ratio * this._lastDuration * 10) / 10;
+          saveD = this._lastDuration;
+          ZHS.Log.info('视频时长变化（' + Math.round(this._lastDuration) + 's → ' + Math.round(d)
+            + 's），进度换算后记录为 ' + Math.round(saveT) + 's');
+        }
+        if (Number.isFinite(d) && d > 0) this._lastDuration = d;
+        this.save(courseId, lessonKey, saveT, saveD);
+      };
+
+      this._saveThrottled = U.throttle(() => saveNow('timeupdate'),
+        Number(ZHS.config.saveIntervalMs) || 5000);
+
+      this._onTimeUpdate = () => { this._saveThrottled(); };
+      this._onPause = () => {
+        // 暂停时立刻存一次，防止关页面丢进度（绕过节流，直接算）
+        if (bindId !== this._bindId) return;
+        if (!ZHS.config.resume) return;
+        const t = video.currentTime;
+        if (!Number.isFinite(t) || t < 5) return;
+        this.save(courseId, lessonKey, t, video.duration);
+      };
+      this._onUnload = () => {
+        if (bindId !== this._bindId) return;
+        if (!ZHS.config.resume) return;
+        const t = video.currentTime;
+        if (!Number.isFinite(t) || t < 5) return;
+        this.save(courseId, lessonKey, t, video.duration);
+      };
+
+      video.addEventListener('timeupdate', this._onTimeUpdate);
+      video.addEventListener('pause', this._onPause);
+      // 关页面/切后台时兜底存一次
+      try {
+        window.addEventListener('pagehide', this._onUnload);
+        document.addEventListener('visibilitychange', () => {
+          if (document.visibilityState === 'hidden') this._onUnload();
+        });
+      } catch (e) { /* 忽略 */ }
+
+      this._boundCourse = courseId;
+      this._boundLesson = lessonKey;
+      ZHS.Log.debug('已绑定进度记录到视频（bind#' + bindId + '，课程 ' + courseId + ' / 节 ' + lessonKey + '）');
+      return true;
+    },
+
+    /** 解绑当前 video 上的监听 */
+    _detach() {
+      const v = this._boundVideo;
+      if (!v) return;
+      try {
+        if (this._onTimeUpdate) v.removeEventListener('timeupdate', this._onTimeUpdate);
+        if (this._onPause) v.removeEventListener('pause', this._onPause);
+        if (this._onUnload) window.removeEventListener('pagehide', this._onUnload);
+      } catch (e) { /* 忽略 */ }
+      this._boundVideo = null;
+      this._bindId = -1;
+      this._boundCourse = null;
+      this._boundLesson = null;
+      this._saveThrottled = null;
+    },
+
+    /** 手动落盘一次（供面板/调试用） */
+    flush() {
+      const v = this._boundVideo;
+      if (!v) return false;
+      const t = v.currentTime;
+      if (!Number.isFinite(t) || t < 5) return false;
+      this.save(ZHS.state.courseId, ZHS.state.lessonKey, t, v.duration);
+      return true;
+    },
+
+    /**
+     * 恢复流程：
+     * 1. 读记录 → 2. 定位课时（点标题切过去）→ 3. 等待 video → 4. 直接播放
+     *    （round-26：第 4 步原先是 seek 到记录点；真机证明 seek 会触发滑块验证码，
+     *     现改为交给平台自身定位，脚本全程不 seek）
+     * 返回是否执行了恢复
+     */
+    async restore(courseId) {
+      if (!ZHS.config.resume) return false;
+      if (this._restored) return false;
+
+      const rec = this.load(courseId);
+      if (!rec || !rec.lessonKey) {
+        ZHS.Log.info('没有可恢复的进度记录，从头开始');
+        return false;
+      }
+
+      ZHS.Log.info('发现续播记录：' + rec.lessonKey + ' @ ' + Math.round(rec.time) + 's');
+
+      // 定位并切到该课时
+      const target = ZHS.Catalog.findByName(rec.lessonKey);
+      if (!target) {
+        ZHS.Log.warn('记录中的课时已不存在（' + rec.lessonKey + '），忽略记录');
+        this.clear(courseId);
+        return false;
+      }
+
+      const currentTitle = ZHS.Catalog.itemTitle(ZHS.Catalog.current());
+      if (currentTitle === rec.lessonKey) {
+        ZHS.Log.info('已在目标课时，直接恢复播放位置');
+      } else {
+        ZHS.Log.info('正在切换到：' + rec.lessonKey);
+        await ZHS.Nav.jumpTo(target, { fromKey: rec.lessonKey });
+        await U.sleep(3000);   // 等切课加载
+      }
+
+      // 等 video 就绪
+      const video = await U.waitFor('video', 20000);
+      if (!video) {
+        ZHS.Log.warn('未等到视频元素，恢复中断');
+        return false;
+      }
+
+      // 等元数据加载
+      await this._waitMetadata(video, 20000);
+
+      // 【2026-10-19 round-26 修订】这里原先是 `ZHS.Player.seekTo(video, finalTime)`。
+      //
+      // 真机结论：智慧树把「异常 seek / 拖进度条」当作脚本特征 —— 一 seek 就弹
+      // 腾讯 Turing 滑块验证码（跨域 iframe，脚本解不了），正是用户说的
+      // 「跳转不支持 / 被检测成脚本」的根因。
+      //
+      // 而「把视频定位到断点」这件事**平台自己就会做**：真机实测点未完成小节的
+      // 标题后，视频直接停在平台记录的断点上（2.25 节 → 停在 474/622）。
+      // 所以脚本只负责「点过去 + 播放」，位置交给平台，全程零 seek。
+      ZHS.Log.info('已切到「' + rec.lessonKey + '」，断点位置由平台自身记录恢复'
+        + '（脚本不 seek —— seek 会触发滑块验证码）');
+      try {
+        if (video.paused) {
+          const p = video.play();
+          if (p && p.catch) p.catch(() => {});
+        }
+      } catch (e) { /* 播放失败不影响主流程，调度器下一轮会保活 */ }
+      this._restored = true;
+      return true;
+    },
+
+    /** 等待 video 元数据 */
+    _waitMetadata(video, timeoutMs) {
+      return new Promise((resolve) => {
+        if (Number.isFinite(video.duration) && video.duration > 0) return resolve(true);
+        const deadline = Date.now() + timeoutMs;
+        const check = () => {
+          if (Number.isFinite(video.duration) && video.duration > 0) return resolve(true);
+          if (Date.now() > deadline) return resolve(false);
+          setTimeout(check, 300);
+        };
+        video.addEventListener('loadedmetadata', () => resolve(true), { once: true });
+        check();
+      });
+    },
+
+    reset() { this._restored = false; },
+  };
+
+  ZHS.Resume = Resume;
+})();
+
+/* ===== 05-scheduler.js ===== */
+/**
+ * 调度层：主循环 + 弹窗守卫
+ *
+ * 每 2 秒跑一次：守卫检查 → 保活播放 → 结束判断 → 下一节
+ */
+(function () {
+  'use strict';
+  const ZHS = window.ZHS;
+  if (!ZHS || !ZHS.Util) return;
+  // 重入守卫：SPA 二次注入时整个模块直接退出，避免定时器/监听器叠加
+  if (ZHS.__mod05_scheduler) return;
+  ZHS.__mod05_scheduler = true;
+  const U = ZHS.Util;
+
+  // 需要用户手动处理才能继续的遮挡层（验证码）
+  const VERIFY_SELECTORS = '.yidun_popup, .yidun_modal, [id^="tcaptcha_transform"]';
+  // 弹题遮挡层。
+  // 必须严格限定在弹题容器内，不能用裸的 .topic-title：
+  // 作业页同样有 .topic-title，裸选择器会在作业页被误判成「弹题」，
+  // 于是先暂停视频、再试图关窗，最后还要耗掉一轮 await 才放行。
+  //
+  // 【2026-09-19 修正】选择器改为从 ZHS.Const 共享常量读取（单一真源），
+  // 并补上 Element UI 弹窗 `.el-dialog__wrapper .el-dialog`。
+  // 原先这里与 src/08-questions.js 的 Dialog.root() 各写一份 `#playTopic-dialog, [class*="topic-dialog"]`，
+  // 两份必须逐字一致才不出错：调度器靠它放行守卫 2，答题器靠它找容器。
+  // 而 Element UI 的「选对才能关」A/B 弹窗 class 里没有 `topic-dialog` 子串 →
+  // 守卫 2 进不去、Dialog.root() 返回 null，脚本对这类弹窗完全无反应（用户报的「脚本没有在答这种题」）。
+  // 现在两边同源，且字面量兜底防模块加载顺序异常。
+  const QUESTION_SELECTORS = ZHS.Const && ZHS.Const.QUESTION_SELECTORS
+    || '#playTopic-dialog, [class*="topic-dialog"], .el-dialog__wrapper .el-dialog';
+  // 其他阻塞弹窗
+  const BLOCK_SELECTORS = '.ss2077-custom-dialog';
+  // 融合课（AI 助教翻转课）的 AI 随堂练习弹窗：没有关闭/跳过按钮，
+  // 必须选一个选项再点提交才会消失，否则视频一直停在原地。
+  // 依据：Autovisor modules/fusion_adapter.py:33 的 AI_CLASS_EXERCISE_DIALOG。
+  const AI_EXERCISE_SELECTORS = '.ai-class-exercise-dialog';
+
+  const LOOP_INTERVAL = 2000;   // 主循环间隔
+  const END_SETTLE_MS = 8000;   // 结束后等平台打勾+上报进度的时间（拉长：对勾/进度常异步延迟，过短会读不到完成态→误判重播）
+  // 切课冷却：刚切完课时页面里可能还是旧的 video 元素（还在 ended 态），
+  // 若不设闸会立刻再次判定「已结束」→ 疯狂连跳、一节课都看不完。
+  // 这是 playback-flow 走查实测复现的致命 bug（BUG-PB-4）。
+  const NAV_COOLDOWN_MS = 15000;
+  // 平台异步上报等待：读到 0% 时先复查一次再决定切（避免丢学时）
+  const PROGRESS_RECHECK_MS = 10000;
+  // 平台「视为已完成」的进度阈值（与目录判定同源，见 src/01-util.js 的 ZHS.Const.FINISH_PCT）
+  const FINISH_PCT = (ZHS.Const && ZHS.Const.FINISH_PCT) || 91;
+  // 视频已放完、平台进度却一直读到 0% 时最多等这么久；超过就停手交人，绝不静默跳过整节
+  const ZERO_PROGRESS_GIVEUP_MS = 3 * 60 * 1000;
+
+  // ===== 守卫预算上限 =====
+  // 弹题/阻塞弹窗这两条守卫仍在 await 上设上限：任何一处永久 await 都会把 2 秒一轮的主循环吊死。
+  // 验证码守卫已改为「不 await、直接 return」（见 _tickInner 守卫 1），不再需要超时常量，
+  // 也就彻底消除了「超时放行」这条错误路径。
+  const QUESTION_WAIT_MAX_MS = 3000;             // 弹题自动关闭失败后：短等放行，别吊住主循环
+  const DIALOG_BUDGET_MS = 25 * 1000;          // 单轮弹题作答预算
+  const BLOCK_GUARD_MAX_TICKS = 15;            // 阻塞弹窗连续点不掉的轮数上限
+  // 切课点击「点了没动」检测：连点同一目标 N 次仍未前进则判失败停手（根治静默死循环）
+  const SAME_NAV_MAX = 5;
+  // round-15【C2】：本轮「不同坏节点轮流失败」的累计上限（全局兜底）。
+  // 只靠 SAME_NAV_MAX 时，5 个不同的坏节点轮着失败永远凑不满同一目标计数 → 无声空转。
+  const NAV_FAIL_TOTAL_MAX = 8;
+
+  const Scheduler = {
+    _timer: null,
+    _busy: false,
+    _navigating: false,
+    _navCount: 0,          // 本次已切换课时数
+    _lastNavAt: 0,         // 最近一次切课时间戳（冷却闸门用）
+
+    /**
+     * 启动主循环
+     * @param opts.manual 手动触发（用户点「启动」按钮）：允许越过 _halted 重新开跑
+     *
+     * _halted 的由来：脚本自己判定「不能再跑」时会停机（目录没识别到、
+     * 达到停止条件、全部看完）。此时若不做标记，页面初始化流程里的
+     * Scheduler.start() 会紧接着把它重新拉起来——结果就是：
+     * 「目录都没认出来，脚本还在那空转」以及「设了 30 分钟自动停，照样停不住」。
+     */
+    start(opts) {
+      const manual = !!(opts && opts.manual);
+      // round-15【A2】：resume = 瞬时故障自愈后的恢复启动，区别于「全新一轮启动」。
+      // 恢复启动绝不能清零 startedAt / _completedThisRun / _navCount，
+      // 否则会连锁引发两个老毛病复发：
+      //   ①「设了看 N 节就停」——计数被清 0 后永远凑不够阈值，停止条件形同虚设；
+      //   ②总结报告里的「总耗时 / 切换课时数」只统计自愈之后的一段，明显少算。
+      const resume = !!(opts && opts.resume);
+      if (this._timer) return;
+      if (this._halted && !manual) {
+        ZHS.Log.debug('此前已判定停止，自动启动被忽略（如需重跑请手动点「启动」）');
+        return;
+      }
+      this._halted = false;
+      ZHS.state.running = true;
+      // round-34：主循环启动时同步拉起防卡死看门狗（停止时由 stop() 一并清理定时器）
+      try { if (ZHS.Guard && ZHS.Guard.start) ZHS.Guard.start(); } catch (e) {}
+
+      // round-16【P1/P2 关键修正】：必须区分两类计数器，不能一刀切「保留」或「重置」——
+      //   · 成果计数器（startedAt / _navCount / _completedThisRun）：
+      //     自愈恢复要**保留**，否则「看 N 节就停」永远凑不够阈值、总结总耗时少算。
+      //   · 止损闸门（_navFailKey / _navFailCount / _navFailTotal）：
+      //     自愈恢复必须**清零**。它们是「连着失败就停手」的保护计数，一旦带着脏值恢复，
+      //     面对同一个坏节点时失败 1 次就立刻再次触发停机 → 60s 冷却后再自愈 → 又停，
+      //     名额耗尽后彻底死亡；用户观感正是「自动恢复后马上又停」。
+      //     止损闸门衡量的是「本轮这一段的连续失败」，恢复即视为新一段。
+      if (resume) {
+        this._navFailKey = null;
+        this._navFailCount = 0;
+        this._navFailTotal = 0;
+        ZHS.Log.info('主循环已恢复（保留本轮计时与完成计数，重置止损闸门）');
+      } else {
+        ZHS.state.startedAt = Date.now();   // 每次「全新」启动才重置计时
+        this._navCount = 0;
+        this._navFailKey = null;
+        this._navFailCount = 0;
+        this._navFailTotal = 0;             // round-15【C2】：本轮累计切课失败
+        this._completedThisRun = 0;         // 停止条件：本次运行完成节数
+        this._zeroSince = 0;                // 「平台进度一直 0%」的等待起点（全新一轮重新计时）
+        this._zeroNotifiedAt = 0;           // 「进度 0%」提示的节流时间戳
+      }
+      // round-15【A1】：自愈名额只在「全新一轮启动」时重置（含用户手动点「启动」）。
+      // 原先 _transientReloads 全仓库只增不减，用满 3 次后即便用户手动重启也救不回来，
+      // 第 4 次故障起永久失去自愈能力。手动启动 = 用户明确要求重来，理应重新给名额。
+      if (!resume) this._transientReloads = 0;
+      this._timer = setInterval(() => this.tick(), LOOP_INTERVAL);
+      this._initDialogObserver();   // round-31：弹题实时监听常驻挂载
+      if (!resume) ZHS.Log.info('主循环已启动');
+      // round-16【P3】：自愈恢复时静默体检 —— 只打日志、不弹「开始自动学习」提示。
+      // 原先每次自愈都重弹一次，配合上面的失败-自愈循环会反复刷屏，反而盖住真实异常。
+      this.preflight({ silent: resume });   // 启动即做一次全量体检（N1）
+    },
+
+    /**
+     * 停止条件检查（用户需求 1）：
+     *   stopMode = 'minutes' → 累计运行 N 分钟后自动停止
+     *   stopMode = 'lessons' → 完成 N 节后自动停止（切课即计 1 节）
+     *   达标走 finishAll 弹总结，给明确完成提示
+     */
+    _checkStopCondition() {
+      const cfg = ZHS.config;
+      if (!cfg.stopMode || cfg.stopMode === 'none') return;
+
+      if (cfg.stopMode === 'minutes') {
+        const min = Math.max(1, Number(cfg.stopMinutes) || 0);
+        const elapsedMin = (Date.now() - (ZHS.state.startedAt || Date.now())) / 60000;
+        if (elapsedMin >= min) {
+          this._stopByCondition(
+            '已达到设定的观看时长 ' + min + ' 分钟',
+            '累计观看 ' + Math.floor(elapsedMin) + ' 分钟'
+          );
+        }
+        return;
+      }
+
+      if (cfg.stopMode === 'lessons') {
+        const n = Math.max(1, Number(cfg.stopLessons) || 0);
+        const done = this._completedThisRun || 0;
+        if (done >= n) {
+          this._stopByCondition(
+            '已达到设定的完成节数 ' + n + ' 节',
+            '本次运行已完成 ' + done + ' 节'
+          );
+        }
+      }
+    },
+
+    /** 达标停止：只触发一次（防重复） */
+    _stopByCondition(title, detail) {
+      if (this._stopFired) return;
+      this._stopFired = true;
+      ZHS.Log.info('=== ' + title + ' ===');
+      ZHS.Log.info(detail);
+      this.finishAll(title + '（' + detail + '）').finally(() => {
+        this._stopFired = false;   // 停止后复位，下次启动可再用
+      });
+    },
+
+    /**
+     * 启动预检（N1 需求）：全量扫描目录三态，报告还剩多少没看完
+     * 目的：开跑前就让用户看到「哪些已完成、哪些没看完、哪些未解锁」
+     */
+    preflight(opts) {
+      // round-16【P3】：silent = 自愈恢复场景调用 —— 只写日志、不弹提示。
+      // 否则每次瞬时故障自愈都会重弹一遍「检测到 N 节未看完，开始自动学习」，
+      // 配合失败-自愈循环会反复刷屏，反而把真正的异常信息淹没掉。
+      const silent = !!(opts && opts.silent);
+      try {
+        const cat = ZHS.Catalog;
+        const bd = cat.breakdown();
+
+        if (!bd.total) {
+          ZHS.Log.warn('目录未识别到任何可学习节点，请确认已进入课程播放页');
+          if (!silent && ZHS.panel) ZHS.panel.alert('未识别到课程目录，请先进入具体课程', 'warn');
+          return bd;
+        }
+
+        ZHS.Log.info('=== 课程体检 ===');
+        ZHS.Log.info('共 ' + bd.total + ' 个节点：已完成 ' + bd.done
+          + ' / 未看完 ' + bd.undone + ' / 未解锁 ' + bd.locked
+          + '（完成度 ' + bd.percent + '%）');
+
+        // round-34：用交叉校验版 trulyAllDone 取代裸 bd.allDone，空/错目录不会误判「全部看完」
+        if (cat.trulyAllDone()) {
+          ZHS.Log.info('课程已全部看完，无需播放');
+          if (!silent && ZHS.panel) ZHS.panel.alert('检测到课程已全部看完', 'info');
+          return bd;
+        }
+
+        // 列出待学清单，便于用户核对
+        const todo = cat.pending().map((el) => cat.itemTitle(el)).filter(Boolean);
+        todo.slice(0, 10).forEach((t, i) => ZHS.Log.info('  待学 ' + (i + 1) + '：' + t));
+        if (todo.length > 10) ZHS.Log.info('  …另有 ' + (todo.length - 10) + ' 节');
+
+        if (!silent && ZHS.panel) {
+          ZHS.panel.alert('检测到 ' + bd.undone + ' 节未看完，开始自动学习', 'info');
+        }
+        return bd;
+      } catch (e) {
+        ZHS.Log.error('预检失败：' + (e && e.message));
+        return null;
+      }
+    },
+
+    /**
+     * 停机
+     * @param why 停机原因分类（round-14）：
+     *   'user'      —— 用户主动点「停止」（默认值，签名不变 → 既有调用点行为完全不变）
+     *   'condition' —— 达到停止条件 / 全部看完（正当结束，不该被自动拉起）
+     *   'transient' —— 瞬时故障被迫停机（目录临时读不到、节点临时定位不到、连点无反应）
+     *
+     * 为什么要分类：原先所有停机都打同一个 _halted=true，导致「目录刚好没读出来」
+     * 这种亚秒级抖动的被迫停机，也被当成「任务结束」永久封死 —— 视频恢复了、
+     * 页面正常了也永远不再动，正是用户报的「中途停了就永远不动」。
+     * 现在只有 user / condition 才封死；transient 允许在受限条件下自愈重启。
+     */
+    stop(why) {
+      if (this._timer) {
+        clearInterval(this._timer);
+        this._timer = null;
+      }
+      this._disposeDialogObserver();   // round-31：停主循环时一并卸载弹题监听
+      ZHS.state.running = false;
+      // round-34：主循环停止时同步停掉防卡死看门狗，避免残留定时器
+      try { if (ZHS.Guard && ZHS.Guard.stop) ZHS.Guard.stop(); } catch (e) {}
+      // round-46 续修：停机即清「模拟离座」幽灵态。拟人暂停只在主循环活跃期有意义，
+      // 残留的 _humanPauseUntil 会在重启后短暂挡住 ensurePlaying（最多 90s 视频冻住）。
+      try { if (ZHS.Player && ZHS.Player.resetHumanPause) ZHS.Player.resetHumanPause(); } catch (e) {}
+      const reason = why || 'user';
+      this._haltReason = reason;
+      // 只有「用户停 / 达标停」才彻底封死；瞬时故障停允许 tryResumeAfterTransientStop 救回
+      this._halted = (reason !== 'transient');
+      if (reason === 'transient') this._transientStoppedAt = Date.now();
+      ZHS.Log.info('主循环已停止' + (reason === 'transient' ? '（瞬时故障，将在条件恢复后尝试自愈）' : ''));
+    },
+
+    /**
+     * 瞬时故障停机后的受限自愈（round-14）：
+     * 仅当「上一次停机原因是 transient」+ 过了冷却期 + 未超次数上限 + 视频元素就绪时，
+     * 才走 start({manual:true}) 把主循环拉起来。
+     *
+     * 安全边界（关键）：用户主动停 / 达标停 → _haltReason 不是 'transient'，
+     * 本方法直接返回 false，绝不会把「用户要求停的脚本」偷偷拉起来。
+     */
+    tryResumeAfterTransientStop() {
+      if (this._timer) return false;                             // 已在跑
+      if (this._haltReason !== 'transient') return false;        // 非瞬时故障停 → 不救
+      const TRANSIENT_COOLDOWN_MS = 60000;                       // 冷却 60s，防高频空转
+      const TRANSIENT_MAX = 3;                                   // 本轮最多自愈 3 次
+      if (Date.now() - (this._transientStoppedAt || 0) < TRANSIENT_COOLDOWN_MS) return false;
+      if ((this._transientReloads || 0) >= TRANSIENT_MAX) {
+        ZHS.Log.warn('瞬时故障已连续自愈 ' + TRANSIENT_MAX + ' 次仍未恢复，停止自动重试，请手动点「启动」');
+        if (ZHS.panel) ZHS.panel.alert('自动恢复多次未成功，已停止重试；请确认网络/页面正常后手动点「启动」', 'warn', 15000);
+        return false;
+      }
+      const v = ZHS.state.videoEl || document.querySelector('video');
+      if (!v) return false;                                      // 视频还没回来，再等 DOM 变化
+      this._transientReloads = (this._transientReloads || 0) + 1;
+      ZHS.Log.info('检测到瞬时故障停机，视频已恢复，尝试自动重启（第 ' + this._transientReloads + ' 次）');
+      // round-15【A2】：必须传 resume:true —— 这是「故障后的续跑」而非「新一轮」，
+      // 不能让 start 把已完成节数 / 开始时间 / 切换课时的统计清零。
+      this.start({ manual: true, resume: true });
+      return true;
+    },
+
+    /**
+     * 给一个异步动作套「总预算」：到点就返回 false，不再死等。
+     * 守卫里所有外部调用（作答、关弹窗）都必须过这一层——
+     * 否则一个没响应的 promise 就能把整个调度器吊死。
+     */
+    async _withBudget(promise, ms, label) {
+      let timer = null;
+      const guard = new Promise((resolve) => {
+        timer = setTimeout(() => resolve('__ZHS_TIMEOUT__'), ms);
+      });
+      try {
+        const r = await Promise.race([promise, guard]);
+        return r !== '__ZHS_TIMEOUT__';
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    },
+
+    /** 单次循环 */
+    async tick() {
+      if (this._busy) return;      // 防重入
+      this._busy = true;
+      try {
+        // M8 学习时长统计：只在本轮主循环真正在跑、且视频处于播放态时累加。
+        // 暂停 / 等待加载 / 弹题阻塞都不计入——习惯分计的是「实际学习时长」，
+        // 把空转时间算进去会让面板显示的进度虚高，反而误导用户。
+        // 同样用可选调用：统计模块缺失或抛错都不得影响主循环。
+        if (ZHS.Stats && ZHS.state && ZHS.state.running) {
+          const v = ZHS.Player && ZHS.Player.video && ZHS.Player.video();
+          if (v && !v.paused && !v.ended) ZHS.Stats.addStudyTime(LOOP_INTERVAL);
+        }
+
+        // 停止条件优先于一切业务（达标立即停，不再看视频）
+        this._checkStopCondition();
+        if (!ZHS.state.running) return;   // _stopByCondition 已停止
+        await this._tickInner();
+      } catch (e) {
+        ZHS.Log.error('主循环异常：' + (e && e.message));
+      } finally {
+        this._busy = false;
+      }
+    },
+
+    async _tickInner() {
+      const cfg = ZHS.config;
+      const video = ZHS.Player.video();
+
+      // ===== 守卫 0（round-29 新增）：页面被整页带走 → 自动回学习页 =====
+      //
+      // 【真机实测 2026-10-19 · 这不是偶发，是确定性行为】
+      // 关掉「AI 助教小智」弹题的「关闭」按钮后，页面会**稳定**整页跳到
+      // www.zhihuishu.com 门户首页（同一门课连测两次，两次都跳）。这正是用户反馈的
+      // 「有的下一集会被网站检测、跳转不支持」的真身之一。
+      //
+      // 跳走后既没有 video、也没有课程目录。此时若照常推进，findNext 会因目录为空
+      // 返回 null → 被判成「没有下一节 / 全部看完」而**误停**（round-27 只做到
+      // 「不推进」，光停着等用户手动切回来，挂机还是断了）。
+      //
+      // 所以这里统一兜底：只要目录读不到、而我们又记得学习页地址，就自己走回去。
+      // 连续 3 轮（约 6 秒）成立才动手，避开「页面刚加载、目录还没渲染」的误判。
+      try {
+        if (ZHS.Catalog && ZHS.Catalog.items && ZHS.Catalog.items().length) {
+          this._courseUrl = location.href;      // 在学习页：随时记住回家的路
+          this._awayTicks = 0;
+        } else {
+          this._awayTicks = (this._awayTicks || 0) + 1;
+          if (this._awayTicks >= 3 && this._courseUrl && location.href !== this._courseUrl) {
+            ZHS.Log.warn('页面被整页带走（当前在 ' + location.hostname + '），自动回到课程学习页继续');
+            if (ZHS.panel) {
+              ZHS.panel.alert('检测到页面跳走，正在自动回到课程学习页…', 'warn', 6000);
+            }
+            this._awayTicks = 0;
+            location.href = this._courseUrl;
+            return;
+          }
+        }
+      } catch (e) { /* 目录读不到不得阻断主循环 */ }
+
+      // ===== 守卫 1：验证码 → 彻底停手，等人，绝不放行 =====
+      //
+      // 【2026-10-06 修订 · 风控合规】旧实现「等待 N 秒超时后放行主循环」是错的。
+      //
+      // 平台规则（Autovisor issue #92 原文）：进播放页立刻弹人机验证，且
+      // **一旦网站没有收到验证模块返回的成功结果，之后的所有学习进度不会被记录，
+      // 而是直接作废**。所以「放行」不会让脚本跑得更快，只会让它在白跑的同时
+      // 继续做跳课等自动化动作——观感就是「用了跟没用一样」，还可能被记为异常。
+      //
+      // 新实现：不 await（不再有「等多久」这个问题），检测到就暂停视频 + 提示，
+      // 然后直接 return。主循环 2 秒一轮，每轮都会再来看一眼，直到验证消失。
+      // 这样既不会把主循环吊死（旧实现的顾虑），也绝不会在验证没过时往前走。
+      // 验证没过期间：不跳课、不播放、不计学习时长、不做任何自动化动作。
+      // 【round-26 补漏】VERIFY_SELECTORS 只覆盖了网易易盾（yidun）与老版 tcaptcha，
+      // **漏了智慧树现在实际在用的腾讯 Turing 滑块**（turing.captcha.gtimg.com）。
+      //
+      // 但绝不能把 iframe 选择器直接塞进 VERIFY_SELECTORS：真机实测那个 iframe
+      // 在视频页是**常驻的休眠占位**（300×150，computed 仍是 display:block / visible），
+      // 裸加会让本守卫永久命中 → 脚本一动不动地停机。所以这里用专门的
+      // 「激活态」判据（覆盖视口的浮层祖先 / 可见验证文案），详见 Util.turingActive。
+      if (cfg.guardOverlays && (U.hasStructurallyVisible(VERIFY_SELECTORS) || U.turingActive())) {
+        if (video && !video.paused) video.pause();
+        if (ZHS.Player) ZHS.Player.resetSync();   // 验证结束后要重新对一次账
+        if (!ZHS.state.pausedByGuard) {
+          ZHS.state.pausedByGuard = true;
+          ZHS.state.guardSince = Date.now();
+          ZHS.Log.warn('检测到安全验证：已暂停所有自动动作。未通过验证前，平台不会记录进度，脚本不会跳课也不会续播。请手动完成验证。');
+          if (ZHS.panel) {
+            ZHS.panel.alert('检测到安全验证，请手动完成。未完成前脚本不会跳课、也不会继续播放（此期间的进度平台不会记录）', 'warn', 15000);
+          }
+        }
+        return;
+      }
+      // 验证已消失 → 复位标记并告知用户等待了多久
+      if (ZHS.state.pausedByGuard) {
+        ZHS.state.pausedByGuard = false;
+        const waitedSec = ZHS.state.guardSince ? Math.round((Date.now() - ZHS.state.guardSince) / 1000) : 0;
+        ZHS.state.guardSince = 0;
+        ZHS.Log.info('安全验证已通过，继续自动学习' + (waitedSec ? '（等待 ' + waitedSec + ' 秒）' : ''));
+        if (ZHS.panel) ZHS.panel.alert('安全验证已通过，继续自动学习', 'info', 6000);
+      }
+
+      // ===== 守卫 2：弹题 → 暂停并交给答题模块 =====
+      // 铁律（修订）：平台不允许关闭未作答的弹题。能答就答、答上了才关；
+      // 答不上就交给人工并安静等待，绝不「关不掉 → 退避 → 再关」无限骚扰。
+      // 二次校验：必须有真实的弹题容器（Dialog.present 会找可操作根节点），
+      // 单靠选择器在一些页面会把普通 DOM 误判成弹题。
+      // 弹窗已消失（人工答完/平台收走）→ 复位待人工标记
+      if (ZHS.Answerer && ZHS.Answerer._pendingHuman && !ZHS.Questions.Dialog.present()) {
+        ZHS.Answerer._pendingHuman = false;
+        ZHS.Log.info('弹题已由人工处理，恢复自动流程');
+      }
+      // 兜底：有些版本弹题容器结构特殊 / 在 #tmDialog_iframe 里，
+      // Dialog.present() 与 hasStructurallyVisible 会双双漏判。只要页面上确实存在
+      // 可见的 #playTopic-dialog / .dialog-test，就按弹题处理并 return，
+      // 绝不允许「带着弹窗继续点下一节」——那正是用户反馈「时长记录不上」的直接原因。
+      const quizByDom = (() => {
+        const vis = (el) => {
+          try {
+            if (!el) return false;
+            const r = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
+            if (!r || (r.width === 0 && r.height === 0)) return false;
+            const cs = getComputedStyle(el);
+            return cs.display !== 'none' && cs.visibility !== 'hidden';
+          } catch (e) { return false; }
+        };
+        try {
+          if (vis(document.querySelector('#playTopic-dialog, .dialog-test'))) return true;
+          const ifr = document.getElementById('tmDialog_iframe');
+          if (ifr) {
+            const doc = ifr.contentDocument || (ifr.contentWindow && ifr.contentWindow.document);
+            if (doc && vis(doc.querySelector('#playTopic-dialog, .dialog-test, .topic-item'))) return true;
+          }
+        } catch (e) { /* 跨域/异常忽略 */ }
+        return false;
+      })();
+      if (cfg.guardOverlays && (quizByDom || (ZHS.Questions.Dialog.present()
+          && U.hasStructurallyVisible(QUESTION_SELECTORS)))) {
+        // round-31【弹题实时感知】：弹窗插入 DOM 立即由 MutationObserver 唤醒
+        // （见 _initDialogObserver / _kickDialog），不再死等下一轮 2 秒轮询；
+        // 主循环路径与即时路径都收敛到同一个 _handleDialog，避免逻辑双份、状态打架。
+        await this._handleDialog();
+        return;
+      }
+      this._dialogHumanNotified = false;
+      // 没有弹题在场 → 实时状态回到空闲（插入即唤醒，消失也即时反映）
+      if (ZHS.state.dialogActive) { ZHS.state.dialogActive = false; ZHS.state.dialogPhase = 'none'; }
+
+      // ===== 守卫 3：其他阻塞弹窗 → 尝试关闭 =====
+      // 关闭按钮有三处来源：Element-UI 的 .close、业务按钮 .btn，
+      // 以及「学前必读」弹窗标题右侧的图标按钮（Autovisor utils.optimize_page 用的就是它）。
+      if (cfg.guardOverlays && U.hasStructurallyVisible(BLOCK_SELECTORS)) {
+        const btn = document.querySelector('.ss2077-custom-dialog .close, .ss2077-custom-dialog .btn, .ss2077-custom-title > img.icon');
+        if (btn) {
+          btn.click();
+          ZHS.Log.debug('已关闭阻塞弹窗');
+        }
+        return;
+      }
+
+      // ===== 守卫 3.5（round-26 新增）：浏览器兼容性「温馨提示」弹窗 =====
+      //
+      // 真机实测：切到新小节时可能弹出 Element UI 的「温馨提示」
+      // （.el-dialog__wrapper.dialog-tips，内容大意是「建议使用 Chrome/火狐观看」）。
+      // 它**不会暂停视频**（视频在弹窗后面照常播），但会盖住画面、也挡住点击。
+      //
+      // 三个坑（真机逐一验证）：
+      //   · 关闭要点「我知道了」/ 右上 X；
+      //   · 「不再提示」只是打个「以后别弹」的标记，**不会关掉当前这一个**；
+      //   · 顶栏那个「返回学堂」是**常驻链接**，点了会整页跳到 www.zhihuishu.com
+      //     门户首页（真机踩过一次），绝对不能碰。
+      if (cfg.guardOverlays) {
+        const tipsWrap = document.querySelector('.el-dialog__wrapper.dialog-tips');
+        if (tipsWrap) {
+          let shown = true;
+          try { shown = getComputedStyle(tipsWrap).display !== 'none'; } catch (e) { shown = true; }
+          if (shown) {
+            let closed = false;
+            const know = U.findByText(tipsWrap, 'button, .el-button, a, [class*="btn"]',
+              ['我知道了', '知道了']);
+            if (know) {
+              try { know.click(); closed = true; } catch (e) { /* 忽略 */ }
+            }
+            if (!closed) {
+              const x = tipsWrap.querySelector('.el-dialog__close, [class*="close"]');
+              if (x) { try { x.click(); closed = true; } catch (e) { /* 忽略 */ } }
+            }
+            if (closed) ZHS.Log.info('已关闭「温馨提示」弹窗（我知道了 / X）');
+          }
+        }
+      }
+
+      // ===== 守卫 4：融合课 AI 随堂练习弹窗 =====
+      // round-39b：已上收为统一处理器——AI 弹题命中 QUESTION_SELECTORS 后被守卫 2 交给
+      // Answerer.handleDialog，并在其入口按 _isAiExercise 分流到 _handleAiExercise
+      // （选→提交→关闭→验收，ocsjs 原厂 grounding，覆盖 .ai-test-question-wrapper 双变体）。
+      // 此处不再重复处理，避免两套逻辑打架；守卫 2 已 return，正常不会到达这里。
+
+      // ===== 无视频：先等加载，连续多个 tick 仍无才判为文档节点切下一节 =====
+      // 防止刚启动视频未加载就误切课
+      if (!video) {
+        this._noVideoTicks = (this._noVideoTicks || 0) + 1;
+        if (this._noVideoTicks === 3) {
+          ZHS.Log.debug('连续 ' + this._noVideoTicks + ' 次未检测到视频，按文档/PPT 节点处理');
+        }
+        if (this._noVideoTicks >= 3) {
+          // 【round-27 导航守卫】真机出现过「整个页面被带走」的情况：切集时偶发
+          // 整页跳到 www.zhihuishu.com 门户首页（此时既没有 video、也没有课程目录）。
+          // 若照旧 gotoNext，findNext 会因目录为空返回 null → 被判成
+          // 「没有下一节 / 全部看完」而**误停** —— 真相是页面跑偏了，不是课看完了。
+          // 所以目录为空时绝不推进，只提示并等待；页面回到学习页后自动继续。
+          let hasCatalog = false;
+          try {
+            hasCatalog = !!(ZHS.Catalog && ZHS.Catalog.items && ZHS.Catalog.items().length);
+          } catch (e) { hasCatalog = false; }
+          if (!hasCatalog) {
+            if (!this._navAwayNotified) {
+              this._navAwayNotified = true;
+              ZHS.Log.warn('连续多次未检测到视频，且页面里找不到课程目录（当前在 '
+                + location.hostname + '）。可能是页面被整页带走了，已暂停推进，等待页面恢复。');
+              if (ZHS.panel) {
+                ZHS.panel.alert('页面似乎跳走了（找不到课程目录），脚本已暂停推进。'
+                  + '请回到课程学习页，脚本会自动继续。', 'warn', 15000);
+              }
+            }
+            this._noVideoTicks = 0;
+            return;
+          }
+          this._navAwayNotified = false;
+          if (cfg.autoNext) await this.gotoNext('当前节点无视频');
+          this._noVideoTicks = 0;
+        }
+        return;
+      }
+      this._noVideoTicks = 0;
+      // ===== 正常保活 =====
+      ZHS.Player.checkStall(video);
+      // 进度对账：播放器不得跑在平台记录前面太多（原理见 03-player.js syncToCatalog）
+      ZHS.Player.syncToCatalog(video, ZHS.state.lessonKey);
+      // round-45：拟人化随机暂停（掷骰子，命中才暂停；暂停期 ensurePlaying 不唤醒）。
+      // 只在自动播放模式下触发 —— 手动模式（autoPlay 关）是用户自己开车，
+      // 脚本擅自暂停等于夺用户的方向盘。
+      // 放在这里的原因：验证码/弹题/阻塞弹窗守卫都在上方已 return，能走到这里
+      // 说明页面是干净播放态。关于「刚切完课不暂停」：本调用虽位于下方切课冷却闸门
+      // （L536 NAV_COOLDOWN_MS）之前、冷却期内仍会被执行，但 maybeHumanPause 内部有
+      // `currentTime < 10` 守卫（L296）——刚切课视频从头播、currentTime < 10s，
+      // 自然不触发；等播过 10s 再暂停已不算「刚切完」，语义正确。（注释于 round-48 修正，
+      // 原「冷却期内根本不执行」表述不准确。）
+      if (cfg.autoPlay) ZHS.Player.maybeHumanPause(video);
+
+      if (cfg.autoPlay) {
+        ZHS.Player.setSpeed(video, cfg.speed);
+        if (cfg.mute) ZHS.Player.mute(video);
+        await ZHS.Player.ensurePlaying(video);
+      }
+
+      // ===== 结束判断 =====
+      // 冷却闸门：刚切完课的一段时间内不做结束判定。
+      // 否则页面里可能还残留上一节的旧 video（仍是 ended 态），会立刻再次
+      // 命中「已结束」→ 12 秒跳一节、一节课都看不完（走查实测BUG-PB-4）。
+      if (this._lastNavAt && Date.now() - this._lastNavAt < NAV_COOLDOWN_MS) {
+        return;
+      }
+
+      if (ZHS.Player.atEnd(video)) {
+        if (cfg.autoNext) await this.onLessonEnd(video);
+      }
+    },
+
+    /**
+     * 弹题处理（单一真源）：主循环守卫 2 与 MutationObserver 即时唤醒都收敛到这里。
+     *
+     * 把原来的守卫 2 体抽成独立方法，是为了根治「2 秒轮询延迟 + 逻辑双份」：
+     *   · 主循环路径：_tickInner 守卫 2 命中即调（保底，每轮都会看一眼）；
+     *   · 即时路径：弹窗一插入 DOM，MutationObserver 立刻 _kickDialog → 调本方法，
+     *     不再死等下一轮轮询，尤其消除「主循环正 await 别的分支时弹题插进来无人管」的空窗。
+     *
+     * 防重入：_dialogHandling 保证两条路径同一时刻只有一条在跑，杜绝状态打架。
+     */
+    async _handleDialog() {
+      if (this._dialogHandling) return;       // 防重入：主循环与 Observer 收敛到同一逻辑
+      this._dialogHandling = true;
+      try {
+        const cfg = ZHS.config;
+        const video = ZHS.Player.video();
+        // 实时状态：进入弹题处理即标记「检测到」
+        ZHS.state.dialogActive = true;
+        ZHS.state.dialogPhase = 'detected';
+        ZHS.state.dialogLastAt = Date.now();
+
+        if (video && !video.paused) video.pause();
+        if (ZHS.Player) ZHS.Player.resetSync();   // 弹题结束后要重新对一次账
+
+        // ===== 守卫 2.0（round-26 新增 / round-29 修正口径）：答案就写在页面里 → 读出来直接关 + 续播 =====
+        // 真机实测：AI 助教小智出的「弹题测验」**有时**会把「正确答案：A」直接渲染在
+        // DOM 里（弹窗里还写明「不影响作业考试成绩」）。这类题不必查题库、也不必调 LLM，
+        // 读出来就是答案；而且它**不做选择也能关闭**（实测点选项后选中态不变）。
+        // 【round-29 重要修正】「答案内嵌」**不是恒定行为，别当铁律**：读不到必须老实降级，
+        // 绝不能假设一定有答案、更不能因为读不到就卡住。
+        // 关闭这类弹窗还有一个副作用：真机实测点「关闭」会**稳定整页跳到门户首页**，
+        // 由守卫 0 自动把页面带回学习页，闭环仍然成立（不会挂机中断）。
+        let domAns = null;
+        try {
+          domAns = (ZHS.Questions && ZHS.Questions.Dialog && ZHS.Questions.Dialog.answerFromDom)
+            ? ZHS.Questions.Dialog.answerFromDom() : null;
+        } catch (e) { domAns = null; }
+        if (domAns) {
+          ZHS.Log.info('弹题答案已内嵌在页面（正确答案：' + domAns + '），直接关闭并续播，不走题库/LLM');
+          try { ZHS.Questions.Dialog.close(); } catch (e) { /* 关不掉下一轮再来 */ }
+          // round-45：固定 500ms 改随机 0.5~1.5s（docs/05 硬约束 8：
+          // 弹题关闭加随机延迟 —— 固定值是机器特征，随机才像人）
+          await U.randomDelay(0.5, 1.5);
+          if (video && video.paused && !video.ended) {
+            // round-52：统一走 Answerer._resumePlay 闭环（点真实播放按钮 + 复检 + 再点），
+            // 不再裸 video.play() 不校验 —— 自定义播放器（prism/video.js/txp）会吞掉裸 play()，
+            // 导致「答案内嵌弹题」关掉后视频不接着放。闭环会复检是否真播、没播再点。
+            if (ZHS.Answerer && ZHS.Answerer._resumePlay) await ZHS.Answerer._resumePlay();
+          }
+          if (ZHS.Player) ZHS.Player.resetSync();
+          // round-46：本分支内联恢复播放（不走 Answerer._resumePlay），
+          // 同样要 resetHumanPause —— 否则「模拟离座」状态跨过弹题干预继续计时，
+          // 到期会假播报「离座结束」（详见 13-answerer._resumePlay 的注释）。
+          if (ZHS.Player) ZHS.Player.resetHumanPause();
+          ZHS.state.dialogPhase = 'answered';   // 已答/已关
+          return;
+        }
+
+        if (ZHS.config.autoAnswer && cfg.answerDialog && ZHS.Answerer) {
+          if (ZHS.Answerer._pendingHuman) {
+            // 待人工期：本题没答上/关不掉，用户正在手动作答。安静等待，
+            // 不强关（平台会拒绝）、不告警刷屏。弹窗消失后下一轮自动复位。
+            ZHS.Log.debug('弹题等待人工作答中，脚本保持暂停');
+            // round-46 续修：等待人工期间必须清「模拟离座」幽灵态，否则用户答完关弹窗后
+            // ensurePlaying 仍被 isHumanPausing() 挡住 → 视频冻住直到 _humanPauseUntil 静默过期。
+            if (ZHS.Player) ZHS.Player.resetHumanPause();
+            ZHS.state.dialogPhase = 'pending-human';
+          } else if (Date.now() < (ZHS.Answerer._cooldownUntil || 0)) {
+            // 退避期内：不作答，直接关弹窗恢复播放，保证不卡死
+            await ZHS.Answerer.forceCloseDialog();
+            ZHS.state.dialogPhase = 'answered';
+          } else {
+            // Answerer 内部已含「作答 → 成功才关闭 → 恢复播放；没答上转人工」完整链路，
+            // 但它可能调 LLM（网络慢/超时），必须套总预算：
+            // 宁可这道题不答，也不能让主循环一直吊在这儿。
+            ZHS.state.dialogPhase = 'answering';
+            const done = await this._withBudget(
+              ZHS.Answerer.handleDialog({ manual: false }), DIALOG_BUDGET_MS, '弹题作答'
+            );
+            if (!done) {
+              ZHS.Log.warn('弹题作答超时（>' + (DIALOG_BUDGET_MS / 1000) + ' 秒），交由人工处理');
+              if (ZHS.panel) ZHS.panel.alert('弹题作答超时，请手动选择答案后关闭弹窗', 'warn', 8000);
+              ZHS.Answerer._pendingHuman = true;
+            }
+            if (ZHS.Answerer._pendingHuman) {
+              // 转人工：等用户答完，不做任何关闭尝试
+            ZHS.Log.debug('弹题已转人工，等待作答');
+            if (ZHS.Player) ZHS.Player.resetHumanPause();   // round-46 续修：同上，转人工即清幽灵态
+            ZHS.state.dialogPhase = 'pending-human';
+            } else if (ZHS.Questions.Dialog.stillPresent()) {
+              // 作答了但弹窗还在：给一次短观察窗，关不掉就计数告警（不硬关）
+              await U.waitUntilHidden(QUESTION_SELECTORS, QUESTION_WAIT_MAX_MS);
+              if (ZHS.Questions.Dialog.stillPresent()) {
+                this._dialogCloseFails = (this._dialogCloseFails || 0) + 1;
+                ZHS.Log.warn('弹题未能自动关闭（第 ' + this._dialogCloseFails + ' 次）。可能是脚本无法自动关闭的弹窗类型，请手动点掉后脚本会继续重试。');
+                if (this._dialogCloseFails >= 3) {
+                  this._dialogCloseFails = 0;
+                  if (ZHS.panel) {
+                    ZHS.panel.alert('弹题连续关不掉，请手动点掉后脚本会继续', 'warn', 10000);
+                  }
+                }
+                ZHS.state.dialogPhase = 'pending-human';   // 关不掉 → 交人工
+                if (ZHS.Player) ZHS.Player.resetHumanPause();   // round-46 续修：同上
+              } else {
+                this._dialogCloseFails = 0;
+                ZHS.state.dialogPhase = 'answered';
+              }
+            } else {
+              // 弹窗已消失 → 视为已答
+              ZHS.state.dialogPhase = 'answered';
+            }
+          }
+        } else {
+          // 未开启自动答题：不作答。平台不允许关闭未作答弹窗，
+          // 尝试一次关闭（部分提示型弹窗可以关），关不掉就明确提示等人工，绝不循环硬关。
+          ZHS.Questions.Dialog.close();
+          await U.sleep(800);
+          if (ZHS.Questions.Dialog.stillPresent()) {
+            ZHS.state.dialogPhase = 'pending-human';
+            if (ZHS.Player) ZHS.Player.resetHumanPause();   // round-46 续修：同上
+            if (!this._dialogHumanNotified) {
+              this._dialogHumanNotified = true;
+              ZHS.Log.warn('弹题需手动作答（未开启自动答题且平台不允许关闭未作答弹窗）');
+              if (ZHS.panel) {
+                ZHS.panel.alert('弹题需要你手动作答：选择答案后即可关闭；或在设置页开启「自动答题」', 'warn', 10000);
+              }
+            } else {
+              ZHS.Log.debug('弹题仍在等待人工作答');
+            }
+          } else {
+            this._dialogHumanNotified = false;
+            ZHS.state.dialogPhase = 'answered';
+            if (video && video.paused) {
+              // round-52：统一走 Answerer._resumePlay 闭环（同上，避免自定义播放器吞裸 play()）
+              if (ZHS.Answerer && ZHS.Answerer._resumePlay) await ZHS.Answerer._resumePlay();
+            }
+          }
+        }
+      } catch (e) {
+        ZHS.Log.error('弹题处理异常：' + (e && e.message));
+      } finally {
+        this._dialogHandling = false;
+      }
+    },
+
+    /**
+     * 弹题实时监听：MutationObserver 常驻，弹窗一插入 DOM 立即唤醒处理。
+     * 挂载点：start()；卸载点：stop()。自带去重，重复 mount 安全。
+     */
+    _initDialogObserver() {
+      if (this._dialogObserver) return;            // 去重：SPA 二次启动不会叠加
+      if (typeof MutationObserver === 'undefined') return;
+      const self = this;
+      this._dialogObserver = new MutationObserver(() => self._onDomMaybeDialog());
+      // 监听全文档子树的增删（Element UI 弹窗默认 append 到 body，覆盖在内）。
+      // 回调只在每个微任务批触发一次，配合 _onDomMaybeDialog 的再合并，开销可控。
+      try {
+        this._dialogObserver.observe(document.documentElement, { childList: true, subtree: true });
+        ZHS.Log.debug('弹题实时监听已挂载（MutationObserver）');
+      } catch (e) {
+        ZHS.Log.debug('弹题实时监听挂载失败：' + e.message);
+      }
+    },
+
+    /** 微任务级去抖：把同一批突变合并成一次判定，避免高并发突变刷爆 CPU */
+    _onDomMaybeDialog() {
+      if (this._dialogKickScheduled) return;
+      this._dialogKickScheduled = true;
+      const self = this;
+      Promise.resolve().then(() => {
+        self._dialogKickScheduled = false;
+        self._kickDialog();
+      });
+    },
+
+    /** 弹窗出现/消失都即时反映；插入即唤醒处理，无需等下一轮 2 秒轮询 */
+    _kickDialog() {
+      if (!ZHS.config.guardOverlays) return;
+      if (!ZHS.Questions || !ZHS.Questions.Dialog) return;
+      if (!ZHS.Questions.Dialog.present()) {
+        // 弹窗已不在场：实时状态回到空闲（消失也即时反映）
+        if (ZHS.state.dialogActive) { ZHS.state.dialogActive = false; ZHS.state.dialogPhase = 'none'; }
+        return;
+      }
+      if (!U.hasStructurallyVisible(QUESTION_SELECTORS)) return;
+      // 主循环可能正 await 别的分支，这里抢跑；重入由 _handleDialog 自己管
+      if (this._dialogHandling) return;
+      Promise.resolve().then(() => {
+        this._handleDialog().catch((e) => ZHS.Log.error('弹题即时处理异常：' + (e && e.message)));
+      });
+    },
+
+    /** 卸载监听：stop() 调用，避免监听器随页面长期堆积 */
+    _disposeDialogObserver() {
+      if (this._dialogObserver) {
+        try { this._dialogObserver.disconnect(); } catch (e) { /* 忽略 */ }
+      }
+      // 无论是否曾经挂载，disposed 后统一置 null（保持「未挂载/已卸载 → null」单一不变量）
+      this._dialogObserver = null;
+      this._dialogKickScheduled = false;
+    },
+
+    /**
+     * 课时结束处理：以「平台记录」为唯一金标准决定下一节
+     *
+     * 设计铁律（用户核心诉求）：只有平台自己的记录（右侧栏对勾 / 进度环百分比）才算「看完了」。
+     * 「视频播放器放到结尾」不是完成信号，只是一个触发器 —— 它只负责把平台记录重新读一遍。
+     *
+     * 【2026-10-06 修订】本条铁律此前只做了一半：读到进度 0% 时脚本会「按视频已放完处理」
+     * 直接跳下一节。但平台规则是人机验证未通过时进度一律作废（会一直读到 0%），
+     * 于是脚本一声不响地把整节跳过去 —— 这正是用户说的「用了跟没用一样」。
+     * 现在 0% 一律不跳：先等平台上报，等不到就提示，超时就停手交人。
+     */
+    async onLessonEnd(video) {
+      if (this._navigating) return;
+      this._navigating = true;
+      try {
+        // round-39c：非视频节点（下载页/文档页，video 常是 duration 0 的桩）——不能按
+        // 「视频放完等平台进度」处理，否则平台永远 0% → 卡满 3 分钟交人（真机：卡在"Windows版"下载节点）。
+        // 改为：停留数秒让平台登记该文档节点，再切下一节。
+        if (video && (!Number.isFinite(video.duration) || video.duration <= 0)) {
+          ZHS.Log.info('当前节点无实际视频流（时长 ' + Math.round(video.duration || 0) + 's，判为文档/下载类节点），停留 4s 让平台登记后切换下一节');
+          await U.sleep(4000);
+          ZHS.Player.resetRetry();
+          await this.gotoNext('非视频节点（无实际视频流）');
+          return;
+        }
+        // 用本轮播放的课时标题找回当前节 DOM（不依赖 .current 类——视频放完后该类可能已转移到下一节）
+        const locateCur = () => (ZHS.state.lessonKey
+          ? (ZHS.Catalog.findByName(ZHS.state.lessonKey) || ZHS.Catalog.current())
+          : ZHS.Catalog.current());
+
+        // 【2026-09-18 修正】原先是「闷头 sleep 8 秒再读一次」的固定等待，两头不讨好：
+        // 平台快的 200ms 就把勾打好了（白等 7.8 秒 × 每一节），慢的 8 秒还没就绪（照样读不到）。
+        // 改成轮询：一看到「完成标记 或 进度够高」立刻往下走，最多等 END_SETTLE_MS 这个上限。
+        const settleDeadline = Date.now() + END_SETTLE_MS;
+        let cur = locateCur();
+        while (Date.now() < settleDeadline) {
+          cur = locateCur();
+          if (cur && (ZHS.Catalog.isFinished(cur) || ZHS.Catalog.progressOf(cur) >= FINISH_PCT)) break;
+          await U.sleep(300);
+        }
+
+        // 1. 金标准：右侧栏完成标记（对勾/已完成图标/已学完文字）
+        if (cur && ZHS.Catalog.isFinished(cur)) {
+          ZHS.Log.info('本课时已完成（右侧栏已记录完成标记），切换下一节');
+          ZHS.Player.resetRetry();
+          await this.gotoNext('本课时已完成');
+          return;
+        }
+
+        const progress = cur ? ZHS.Catalog.progressOf(cur) : 0;
+
+        // 2. 平台进度达到完成阈值 → 视作已完成，跳
+        if (progress >= FINISH_PCT) {
+          ZHS.Log.info('本课时平台记录 ' + progress + '%，判定已完成，切换下一节');
+          ZHS.Player.resetRetry();
+          await this.gotoNext('本课时已完成');
+          return;
+        }
+
+        // 3. 平台进度读不到（<=0）→ 【2026-10-06 修订】绝不再「按视频已放完处理」直接跳。
+        //
+        // 旧实现一声不响地跳下一节，是本脚本最伤用户的一条逻辑：
+        // 平台规则（Autovisor issue #92）—— 人机验证未通过时，之后的学习进度全部作废。
+        // 此时进度会一直是 0%，旧实现于是飞快地把整节跳过去，
+        // 用户既没学到、平台也没记到，观感就是「跳得挺欢、课一节没算上」。
+        // 新实现：先给平台一次异步上报的机会；仍为 0 就不跳、只提醒；
+        // 超过 ZERO_PROGRESS_GIVEUP_MS 就停手交人。宁可停住让人看见，也不静默白看。
+        if (progress <= 0) {
+          const now = Date.now();
+          if (!this._zeroSince) this._zeroSince = now;
+          const waited = now - this._zeroSince;
+
+          if (waited < PROGRESS_RECHECK_MS) {
+            ZHS.Log.info('视频已放完，平台尚未上报进度（已等 ' + Math.round(waited / 1000) + ' 秒），再等一轮');
+            return;
+          }
+          if (waited < ZERO_PROGRESS_GIVEUP_MS) {
+            // 主循环 2 秒一轮，提示必须节流，否则刷屏
+            if (now - (this._zeroNotifiedAt || 0) > 30000) {
+              this._zeroNotifiedAt = now;
+              ZHS.Log.warn('视频已放完，但平台进度仍为 0%。常见原因：安全验证未完成（此期间的进度平台不会记录）。已停止切换课时，继续等待。');
+              if (ZHS.panel) {
+                ZHS.panel.alert('视频已放完，但平台没记录进度（0%）。多半是安全验证没过——请看看页面上有没有验证弹窗。脚本不会跳过这一节，避免白看。', 'warn', 15000);
+              }
+            }
+            return;
+          }
+          // 超过放弃阈值：停手 + 明确告知，绝不静默跳过
+          this._zeroSince = 0;
+          this._zeroNotifiedAt = 0;
+          ZHS.Log.error('平台进度持续为 0% 超过 ' + Math.round(ZERO_PROGRESS_GIVEUP_MS / 1000) + ' 秒，已停止自动跳转，请人工确认该课时。');
+          if (ZHS.panel) {
+            ZHS.panel.alert('平台进度一直是 0%，脚本已停手（不再跳课）。请手动检查：页面上是否有安全验证？这一节是否真的播完了？处理完可点「启动」重来。', 'error', 20000);
+          }
+          this.stop('zero-progress');
+          return;
+        }
+        // 读到有效进度 → 复位 0% 计时与提示节流
+        this._zeroSince = 0;
+        this._zeroNotifiedAt = 0;
+
+        // 4. 仅当进度明显偏低（1 ~ FINISH_PCT-1）且右侧栏无完成标记时，才重播兜底（最多 2 次）
+        //    这是平台进度确实没同步才需要的补救；其余一律跳，避免「重看一遍」。
+        if (progress < FINISH_PCT) {
+          const retried = await ZHS.Player.retryFromPlatformProgress(video, progress);
+          if (retried) {
+            ZHS.Log.warn('进度仅 ' + progress + '% 且未完成记录，回退重播补齐（平台进度未同步）');
+            return;   // 重播中，下一轮 atEnd 会再次进入本函数
+          }
+          ZHS.Log.warn('重播次数用尽仍不同步，直接跳下一节（不卡死）');
+        }
+
+        // 5. 兜底：任何未命中上述分支的情况，都跳下一节，绝不重播
+        ZHS.Player.resetRetry();
+        await this.gotoNext('课时结束，切换下一节');
+      } finally {
+        this._navigating = false;
+      }
+    },
+
+    /**
+     * 切换下一节
+     * @param reason 触发原因（日志用）
+     * @param opts.manual 手动触发：跳过随机延迟、被重入挡下时给出提示而不是静默
+     */
+    async gotoNext(reason, opts) {
+      const manual = !!(opts && opts.manual);
+      // 锁归属：调用方（onLessonEnd）已持锁则复用；空闲时本函数持锁。
+      // 手动触发遇忙要提示，不能静默吞掉。
+      const owned = !this._navigating;
+      if (!owned && manual) {
+        ZHS.Log.warn('正在切换课时中，请稍候');
+        if (ZHS.panel) ZHS.panel.alert('正在切换课时中，请稍候', 'warn');
+        return;
+      }
+      if (owned) this._navigating = true;
+
+      const cfg = ZHS.config;
+      // 优先用本轮课时标识 lessonKey 定位当前节（与 onLessonEnd 的 locateCur 保持一致）：
+      // 视频放完后平台的 .current / active 类可能已经转移到下一节，若这里仍用
+      // Catalog.current() 会拿错起点，导致 findNext 跳过已就绪的下一节。
+      const cur = ZHS.state.lessonKey
+        ? (ZHS.Catalog.findByName(ZHS.state.lessonKey) || ZHS.Catalog.current())
+        : ZHS.Catalog.current();
+      const cat = ZHS.Catalog;
+
+      try {
+        // round-35：先异步把虚拟滚动目录全加载出来（等平台分批渲染），
+        // 否则未学节还在 DOM 外就被判「没有下一节」。
+        if (cat.ensureCatalogLoadedAsync) await cat.ensureCatalogLoadedAsync();
+        // 先看全目录还剩多少没完成
+        const bd = cat.breakdown();
+        // skipFinished 关闭时：不主动跳课，按顺序走（已完成也停一下，便于人工核对）
+        const next = cfg.skipFinished === false
+          ? this._nextInOrder(cur, cat)
+          : cat.findNext(cur);
+
+        if (!next) {
+          if (bd.total === 0) {
+            // 目录都没识别到：绝不能弹「全部看完」的假总结
+            ZHS.Log.warn('未识别到课程目录，无法切换。请确认已进入课程播放页');
+            if (ZHS.panel) ZHS.panel.alert('未识别到课程目录，请先进入具体课程的播放页', 'error');
+            // round-14：目录临时读不到属瞬时故障（SPA 重渲染/懒加载瞬间），允许自愈，不永久封死
+            this.stop('transient');
+          } else if (bd.undone === 0 && cat.trulyAllDone()) {
+            // 真正全看完（round-34：经检测健康+视频进度交叉校验，排除空/错目录误判）：
+            // 先看是否要「自动跳课」回课程中心找下一门，
+            // 没开开关（或不在学习页 / 模块缺失）就保持原有「出总结并停止」行为。
+            const hub = ZHS.CourseHub;
+            const canHop = cfg.autoCourseHop && hub && !hub.isHubPage();
+            if (canHop) {
+              hub.markCourseDone(ZHS.state.courseId);
+              ZHS.Log.info('[课程中心] 本课程已全部学完，准备返回课程中心寻找下一门课');
+              // round-15【A4】：本课程学完回课程中心属「正当结束」，用 'condition' 与瞬时故障区分
+              this.stop('condition');
+              hub.returnToHub();
+            } else {
+              await this.finishAll(reason);
+            }
+          } else {
+            // 有未完成但找不到（状态识别可能有偏差），停手让人看
+            ZHS.Log.warn('还有 ' + bd.undone + ' 节未完成，但无法定位到可点击节点（可能被锁定或选择器不匹配）');
+            if (ZHS.panel) ZHS.panel.alert('还有 ' + bd.undone + ' 节未完成但定位失败，请检查目录', 'warn');
+            // round-14：定位失败多为懒加载/虚拟滚动的瞬时态，允许自愈
+            this.stop('transient');
+          }
+          return;
+        }
+
+        // （「同目标反复点」的失败计数原先放在这里 —— 2026-09-18 修正后已下移到点击校验之后，
+        //   理由：点击前自增会把「还没点」也算成一次失败，且目标一变就清零，
+        //   反而把「点了没动」这件真正要抓的事掩盖掉。详见下方 clickAndVerify 分支。）
+        // 人类化随机延迟（手动触发跳过，点了就要动）
+        if (!manual) {
+          const delay = 1 + Math.random() * (cfg.nextDelayMax - cfg.nextDelayMin) + cfg.nextDelayMin;
+          ZHS.Log.info('即将切换到「' + cat.itemTitle(next) + '」，等待 ' + Math.round(delay) + ' 秒'
+            + '（剩余未完成 ' + bd.undone + ' 节）');
+          await U.sleep(delay * 1000);
+        } else {
+          ZHS.Log.info('手动切换到「' + cat.itemTitle(next) + '」');
+        }
+
+        // 停止闸门（BUG-UX-6）：随机延迟可能长达十几秒，期间用户点了「停止」，
+        // 若不复查就照样点下去，会出现「明明停了页面还在跳」。
+        // 手动触发例外——用户刚点过按钮，就是要跳。
+        if (!ZHS.state.running && !manual) {
+          ZHS.Log.info('运行已停止，取消本次跳转');
+          return;
+        }
+
+        // 记录新课时标识，供续播使用。
+        // round-14【P1 关键修正】：改「点击前就写」为「点击成功后写」。
+        // 原先这里在点击前就把 lessonKey 改成目标节，一旦点击失败（下面的 !switched 分支）
+        // 又不回滚，就会把「下一节的进度」记到「本来那一节」的标题上（Resume.bindVideo 用错键），
+        // 下一轮 Catalog 的完成判定也会打错节点，进而从错位置往后 findNext → 静默跳过整节课。
+        // 这是唯一的「写错数据」级缺陷：宁可暂时用旧键，也绝不能把进度记到错的节上。
+        const _targetKey = cat.itemTitle(next);
+        const _prevKey = ZHS.state.lessonKey;   // 备份，失败时回滚用
+
+        // 【2026-09-18 关键修正】原来这里是「点一下就走」，点没点中没人管 ——
+        // 这正是用户报的「点了下一节也没用」。现在点完必须验收：
+        // 轮询等目标条目拿到 active（SPA 异步，可能晚几百毫秒），没拿到就再点一次。
+        // round-14【P4】：clickAndVerify 内部已加「当前节必须真的从旧节变成新节」的第二信号校验。
+        // round-35：改用 Nav.jumpTo —— 它内部按「SPA 内部 API → URL 深链 → 拟人化点击」顺序尝试，
+        // 绝大多数情况不再依赖会被反作弊判定为脚本的合成点击。
+        let switched = await ZHS.Nav.jumpTo(next, { timeout: 3000, fromKey: _prevKey, allowNativeNext: true });
+        // round-39c：穷举兜底——Nav 全策略（SPA/URL/原生按钮/拟人点击）都失败后，
+        // 对目标项的各候选子目标逐一拟人点击，每个点击后以「当前课时是否真变成目标」验收
+        // （不看选中态，AI/新版布局选中态常不可见），命中即收。
+        if (!switched) switched = await this._exhaustiveSwitch(next, _targetKey, _prevKey);
+        if (!switched) {
+          // round-14【P1】：点击失败 → 课时标识必须回滚，绝不让「记错节」发生
+          ZHS.state.lessonKey = _prevKey;
+          // round-15【C2】：原判据「同一目标才累加、目标一变就清零」有软死循环漏洞 ——
+          // 若目录里有 5 个不同的坏节点轮流失败，计数永远凑不满 5，于是既不停机也不前进，
+          // 无声空转。现在改为双计数：同目标连续失败（快速止损）+ 本轮累计失败（全局兜底）。
+          this._navFailCount = (_targetKey === this._navFailKey ? this._navFailCount : 0) + 1;
+          this._navFailKey = _targetKey;
+          this._navFailTotal = (this._navFailTotal || 0) + 1;
+          const hitSame = this._navFailCount >= SAME_NAV_MAX;
+          const hitTotal = this._navFailTotal >= NAV_FAIL_TOTAL_MAX;
+          ZHS.Log.warn('点击「' + _targetKey + '」后未检测到切换（同目标 ' + this._navFailCount
+            + ' 次 / 本轮累计 ' + this._navFailTotal + ' 次），已回滚课时标识');
+          // round-39c：切课失败自诊断——首次失败即 dump 目标项真实结构/框架/适配器/遮罩/可点子目标，
+          // 下一跑凭这段精准定位"这个布局到底该点哪个、要不要真实点击"。
+          if (this._navFailCount <= 1) this._dumpSwitchDiag(next);
+          if (hitSame || hitTotal) {
+            const _why = hitSame
+              ? '连续 ' + this._navFailCount + ' 次点击「' + _targetKey + '」都无反应'
+              : '本轮累计 ' + this._navFailTotal + ' 次切课失败（多个节点轮番点击无反应）';
+            ZHS.Log.error(_why + '（疑似平台改版或目录节点不可点），已停止自动跳转');
+            if (ZHS.panel) ZHS.panel.alert('切课失败：' + _why + '，已停止自动跳转，请手动切换', 'error', 15000);
+            // round-14：平台响应慢时也可能凑齐连点次数，属瞬时故障，允许冷却后自愈重试
+            this.stop('transient');
+            return;
+          }
+          if (ZHS.panel) ZHS.panel.alert('切换「' + _targetKey + '」未生效，正在重试…', 'warn', 6000);
+          this._lastNavAt = Date.now();
+          // round-14【P5】：失败分支的 rebind 缩短为 5 秒。原先走默认 20 秒，
+          // 比 15 秒冷却闸门还长 → 闸门失效、BUG-PB-4（12 秒跳一节）复发，
+          // 且单轮主线程被 _busy 独占近 29 秒，期间弹题守卫/保活全停摆。
+          await this._rebindAfterNav(5000);
+          return;
+        }
+
+        // round-14【P1】：确认切换成功后才写新课时标识（此时记进度才是对的）
+        ZHS.state.lessonKey = _targetKey;
+
+        // 确实切过去了 → 失败计数清零（含 round-15 新增的本轮累计失败）
+        this._navFailCount = 0;
+        this._navFailTotal = 0;
+        this._navFailKey = null;
+        this._navCount++;
+        this._completedThisRun = (this._completedThisRun || 0) + 1;   // 停止条件：完成节数
+        this._lastNavAt = Date.now();   // 打时间戳：闸门据此屏蔽旧 video 的残留 ended 态
+
+        // 重置状态
+        ZHS.Player.resetRetry();
+        ZHS.Player.resetHumanPause();   // round-45：旧节的「模拟离座」不带到新节
+        ZHS.Resume.reset();
+        if (ZHS.Answerer) ZHS.Answerer.reset();
+        ZHS.state.videoEl = null;
+
+        await U.sleep(3000);
+        await this._rebindAfterNav();
+      } finally {
+        if (owned) this._navigating = false;
+      }
+    },
+
+    /**
+     * round-39c：穷举切换兜底——Nav 全策略失败后，对目标项各候选子目标逐一拟人点击，
+     * 每个点击后以「当前课时是否真变成 targetKey」验收（不看选中态）。命中即返回 true。
+     */
+    async _exhaustiveSwitch(el, targetKey, prevKey) {
+      const cat = ZHS.Catalog;
+      const U2 = ZHS.Util;
+      const switchedNow = async () => {
+        try {
+          const cur = cat.current();
+          if (!cur) return false;
+          const ck = cat.itemTitle(cur);
+          if (prevKey && ck === prevKey && ck !== targetKey) return false;
+          return ck === targetKey;
+        } catch (e) { return false; }
+      };
+      const cands = [];
+      const add = (c) => { try { if (c && cands.indexOf(c) < 0) cands.push(c); } catch (e) {} };
+      try { add(el.querySelector('a[href]')); } catch (e) {}
+      try { add(el.querySelector('[onclick]')); } catch (e) {}
+      try { add(el.querySelector('[class*="title"],[class*="name"],[class*="chapter"],[class*="text"]')); } catch (e) {}
+      try { add(el.querySelector('i, svg, [class*="icon"]')); } catch (e) {}
+      add(el);
+      for (const c of cands) {
+        try { if (U2.realClickHuman) U2.realClickHuman(c); else c.click(); }
+        catch (e) { try { c.click(); } catch (e2) {} }
+        await U2.sleep(900);
+        // eslint-disable-next-line no-await-in-loop
+        if (await switchedNow()) {
+          ZHS.Log.info('穷举切换：命中候选子目标，已切到「' + targetKey + '」');
+          return true;
+        }
+      }
+      return false;
+    },
+
+    /**
+     * round-39c：切课失败自诊断——把目标目录项真实结构/框架/适配器/遮罩/可点子目标打日志，
+     * 用于精准定位"这个通用兜底布局到底该点哪个元素、要不要真实点击"。
+     */
+    _dumpSwitchDiag(el) {
+      const L = [];
+      try {
+        L.push('=== 切课诊断 ' + new Date().toLocaleTimeString() + '（请把这段发给开发者） ===');
+        try {
+          L.push('framework: vue=' + (window.Vue && window.Vue.version) + ' nuxt=' + !!window.__NUXT__
+            + ' react=' + (!!window.React || Object.keys(window).some((k) => /^__react/.test(k))) + ' jq=' + !!window.jQuery);
+        } catch (e) {}
+        try {
+          const ad = ZHS.Catalog && ZHS.Catalog.adapter;
+          L.push('adapter: ' + (ad ? ((ad.name || '?') + ' | container=' + ad.container + ' | items=' + ad.items + ' | clickTarget=' + ad.clickTarget) : 'null'));
+        } catch (e) {}
+        if (el) {
+          try {
+            const r = el.getBoundingClientRect ? el.getBoundingClientRect() : { x: 0, y: 0, width: 0, height: 0 };
+            const cx = Math.round(r.x + r.width / 2), cy = Math.round(r.y + r.height / 2);
+            let at = null; try { at = document.elementFromPoint(cx, cy); } catch (e) {}
+            const attrs = {}; try { Array.from(el.attributes || []).forEach((a) => { attrs[a.name] = String(a.value).slice(0, 60); }); } catch (e) {}
+            L.push('target: <' + el.tagName + '> cls="' + (el.className || '').toString().slice(0, 120) + '" rect=' + Math.round(r.x) + ',' + Math.round(r.y) + ',' + Math.round(r.width) + 'x' + Math.round(r.height));
+            L.push('  attrs=' + JSON.stringify(attrs));
+            L.push('  onclick=' + (el.getAttribute ? !!el.getAttribute('onclick') : '?') + ' vue=' + !!(el.__vue__ || el.__vueParentComponent) + ' shadow=' + (el.getRootNode ? (el.getRootNode() instanceof ShadowRoot) : '?'));
+            L.push('  elementFromPoint(center)=' + (at ? at.tagName + '.' + (at.className || '').toString().slice(0, 40) : 'null') + ' covered=' + (at && at !== el && !el.contains(at) ? 'YES(被盖住)' : 'no'));
+            L.push('  html=' + (el.outerHTML || '').replace(/\s+/g, ' ').slice(0, 300));
+            const cands = [];
+            try { const a = el.querySelector('a[href]'); if (a) cands.push('a[href]=' + String(a.getAttribute('href')).slice(0, 40)); } catch (e) {}
+            try { if (el.querySelector('[onclick]')) cands.push('[onclick]'); } catch (e) {}
+            try { const ti = el.querySelector('[class*="title"],[class*="name"]'); if (ti) cands.push('title-child=<' + ti.tagName + '>'); } catch (e) {}
+            L.push('  clickCandidates=' + JSON.stringify(cands));
+          } catch (e) { L.push('target err: ' + e.message); }
+        } else { L.push('target: null'); }
+        try {
+          L.push('current lessonKey=' + ZHS.state.lessonKey + ' | catalog.current=' + (ZHS.Catalog.current ? (ZHS.Catalog.itemTitle(ZHS.Catalog.current()) || '?') : '?'));
+        } catch (e) {}
+        L.push('=== 切课诊断结束 ===');
+      } catch (e) { L.push('诊断异常: ' + e.message); }
+      L.forEach((l) => { try { ZHS.Log.warn(l); } catch (e) {} });
+    },
+
+    /**
+     * 顺序推进：不看完成态，直接取当前项的下一个（skipFinished=false 时用）
+     */
+    _nextInOrder(cur, cat) {
+      const all = cat.items();
+      if (!all.length) return null;
+      let startIdx = 0;
+      if (cur) {
+        const i = all.indexOf(cur);
+        if (i >= 0) startIdx = i + 1;
+      }
+      // 未解锁的跳过（点了也没用）
+      for (let i = startIdx; i < all.length; i++) {
+        if (cat.statusOf(all[i]) !== ZHS.STATUS.LOCKED) return all[i];
+      }
+      return null;
+    },
+
+    /**
+     * 全部看完 → 生成总结报告，弹出结论，停止运行
+     */
+    async finishAll(reason) {
+      const cat = ZHS.Catalog;
+      const bd = cat.breakdown();
+      const raw = ZHS.Solver ? ZHS.Solver.stats : {};
+      const st = {
+        bank: raw.bank || 0, llm: raw.llm || 0, cache: raw.cache || 0,
+        fuzzy: raw.fuzzy || 0, heuristic: raw.heuristic || 0,
+        random: raw.random || 0, skipped: raw.skipped || 0, fail: raw.fail || 0,
+      };
+      const elapsedMs = Date.now() - (ZHS.state.startedAt || Date.now());
+      const mins = Math.floor(elapsedMs / 60000);
+      const secs = Math.floor((elapsedMs % 60000) / 1000);
+
+      const report = {
+        触发原因: reason || '全部完成',
+        课程名: cat.getCourseName() || '(未识别)',
+        页面版本: cat.adapter.label || ZHS.state.siteVersion,
+        总节点: bd.total,
+        已完成: bd.done,
+        未完成: bd.undone,
+        未解锁: bd.locked,
+        完成度: bd.percent + '%',
+        本次切换课时数: this._navCount,
+        本次完成节数: this._completedThisRun || 0,
+        已答题数: ZHS.state.answeredCount,
+        答题通道: '题库 ' + st.bank + ' / LLM ' + st.llm + ' / 缓存 ' + st.cache
+          + ' / 模糊 ' + st.fuzzy + ' / 启发式 ' + st.heuristic
+          + ' / 随机 ' + st.random + ' / 未作答 ' + st.skipped + ' / 失败 ' + st.fail,
+        漏答题数: st.skipped,
+        总耗时: mins + ' 分 ' + secs + ' 秒',
+        结束时间: new Date().toLocaleString('zh-CN'),
+      };
+
+      // 标题不能撒谎（BUG-UX-15）：达标停止 / 未看完就停 都不能硬说「全部看完」。
+      // 面板 showReport 早已按这个口径动态判定，日志此前却写死了，两边说法打架。
+      const headline = Number(report.未完成) === 0 && Number(report.总节点) > 0
+        ? '=== 全部课程已看完 ==='
+        : '=== 运行已结束（仍有 ' + report.未完成 + ' 节未完成）===';
+      ZHS.Log.info(headline);
+      Object.keys(report).forEach((k) => ZHS.Log.info('  ' + k + '：' + report[k]));
+
+      // 控制台结构化输出（不用 console.table：在部分无头/受限环境里它会挂起）
+      try {
+        const lines = Object.keys(report).map((k) => k + ': ' + report[k]).join('\n');
+        console.log('[智慧树助手·总结]\n' + lines);
+      } catch (e) { /* 忽略 */ }
+
+      ZHS.state.lastReport = report;
+      // round-15【A4】：finishAll 是「任务达标/全部完成」的正当结束，标 'condition' 彻底封死，
+      // 绝不能被瞬时故障自愈逻辑误判为可恢复。
+      this.stop('condition');
+
+      if (ZHS.panel) ZHS.panel.showReport(report);
+    },
+
+    /** 取最近一次总结报告 */
+    lastReport() { return ZHS.state.lastReport || null; },
+
+    /** 切课后重新绑定 video */
+    async _rebindAfterNav(waitMs) {
+      // round-14【P5】：允许调用方指定等待时长。失败分支传 5000，避免 20 秒等待
+      // 超过 15 秒冷却闸门，导致闸门失效 + 主线程被 _busy 独占期间弹题守卫停摆。
+      let video = await U.waitFor('video', waitMs || 20000);
+      if (!video && ZHS.Util.findVideoInIframes) video = ZHS.Util.findVideoInIframes(document);
+      if (!video) {
+        ZHS.Log.warn('切课后未找到视频元素');
+        return;
+      }
+      ZHS.state.videoEl = video;
+      const courseId = ZHS.state.courseId;
+      const lessonKey = ZHS.state.lessonKey;
+      ZHS.Resume.bindVideo(video, courseId, lessonKey);
+      // round-45：切课后强制续播（docs/05 硬约束 3）。
+      // 真机实测：点小节标题切集后平台把视频定位到断点、且 paused=true，
+      // 必须主动 play() 才会继续（与关弹题后同理）。这里不等主循环下一轮
+      // （2 秒后）才保活 —— 绑定时就地尝试，并短轮询确认 paused===false。
+      if (ZHS.config.autoPlay) {
+        try {
+          if (video.paused) {
+            video.muted = true;               // 静音兜底：部分浏览器拒绝非用户手势的 play()
+            const p = video.play();
+            if (p && typeof p.catch === 'function') p.catch(() => {});
+          }
+          for (let i = 0; i < 3 && video.paused && !video.ended; i++) {
+            await U.sleep(600);
+            if (video.paused) {
+              const p2 = video.play();
+              if (p2 && typeof p2.catch === 'function') p2.catch(() => {});
+            }
+          }
+          if (video.paused && !video.ended) {
+            ZHS.Log.debug('切课后首次 play 未生效（ paused 仍在），交给主循环保活');
+          } else {
+            ZHS.Log.info('已切换并重新绑定并恢复播放：' + lessonKey);
+            return;
+          }
+        } catch (e) { /* 播放失败不影响主流程，主循环下一轮会保活 */ }
+      }
+      ZHS.Log.info('已切换并重新绑定：' + lessonKey);
+    },
+
+    /**
+     * v0.6.64 手动选择指定课时（面板「跳到指定课时」/ zhs.gotoLesson 走这里）。
+     *
+     * target：数字 = 目录第 N 节（1 起）；字符串 = 标题子串匹配（也认纯数字串按索引）。
+     *
+     * 设计要点：
+     *   · 复用 Nav.jumpTo + _exhaustiveSwitch + _rebindAfterNav 全套稳健切换执行体，
+     *     只换「目标怎么来」，绝不简化切换逻辑——简化会重新引入 round-14~39c 踩平的
+     *     「点了没反应 / 记错节」老 bug。
+     *   · allowNativeNext 传 false：任意目标课时若走平台「下一节」按钮会跳到错误的节，
+     *     只有 gotoNext（目标本就是下一节）才允许 nativeNext。
+     *   · 失败一律回滚 lessonKey，绝不让进度记到错的节上（round-14 P1 铁律）。
+     * @returns {Promise<{ok:boolean, title:string}>}
+     */
+    async gotoLesson(target, opts) {
+      const cat = ZHS.Catalog;
+      const U2 = ZHS.Util;
+      if (this._navigating) {
+        ZHS.Log.warn('正在切换课时中，请稍候');
+        if (ZHS.panel) ZHS.panel.alert('正在切换课时中，请稍候', 'warn');
+        return { ok: false, title: '' };
+      }
+      this._navigating = true;
+      const _prevKey = ZHS.state.lessonKey;
+      try {
+        if (cat.ensureCatalogLoadedAsync) await cat.ensureCatalogLoadedAsync();
+        const el = this._resolveLessonTarget(target);
+        if (!el) {
+          ZHS.Log.warn('找不到目标课时：' + String(target).slice(0, 30));
+          if (ZHS.panel) ZHS.panel.alert('找不到目标课时：' + String(target).slice(0, 30), 'warn', 6000);
+          return { ok: false, title: '' };
+        }
+        const targetKey = cat.itemTitle(el);
+        if (targetKey && targetKey === _prevKey) {
+          ZHS.Log.info('已在目标课时：' + targetKey);
+          return { ok: true, title: targetKey };
+        }
+        ZHS.Log.info('手动跳到指定课时：' + targetKey);
+        let switched = await ZHS.Nav.jumpTo(el, { timeout: 3000, fromKey: _prevKey, allowNativeNext: false });
+        if (!switched) switched = await this._exhaustiveSwitch(el, targetKey, _prevKey);
+        if (!switched) {
+          ZHS.state.lessonKey = _prevKey;   // 回滚，绝不记错节
+          ZHS.Log.warn('跳转「' + targetKey + '」未生效，已回滚课时标识');
+          if (ZHS.panel) ZHS.panel.alert('跳转「' + targetKey + '」未生效', 'warn', 6000);
+          return { ok: false, title: targetKey };
+        }
+        // 确认切换成功后才写新课时标识（此时记进度才是对的）
+        ZHS.state.lessonKey = targetKey;
+        this._navFailCount = 0;
+        this._navFailTotal = 0;
+        this._navFailKey = null;
+        // 与 gotoNext 成功分支一致的状态重置
+        ZHS.Player.resetRetry();
+        ZHS.Player.resetHumanPause();
+        ZHS.Resume.reset();
+        if (ZHS.Answerer) ZHS.Answerer.reset();
+        ZHS.state.videoEl = null;
+        await U2.sleep(1500);
+        await this._rebindAfterNav();
+        return { ok: true, title: targetKey };
+      } catch (e) {
+        ZHS.state.lessonKey = _prevKey;
+        ZHS.Log.warn('gotoLesson 异常：' + (e && e.message));
+        return { ok: false, title: '' };
+      } finally {
+        this._navigating = false;
+      }
+    },
+
+    /** v0.6.64：把 target（数字索引 1 起 / 标题子串 / 纯数字串）解析成目录元素 */
+    _resolveLessonTarget(target) {
+      const cat = ZHS.Catalog;
+      let items = [];
+      try { items = cat.items() || []; } catch (e) { return null; }
+      if (!items.length) return null;
+      if (typeof target === 'number' && Number.isFinite(target)) {
+        const idx = Math.floor(target) - 1;
+        return (idx >= 0 && idx < items.length) ? items[idx] : null;
+      }
+      const s = String(target == null ? '' : target).trim();
+      if (!s) return null;
+      if (/^\d+$/.test(s)) {
+        const idx = Number(s) - 1;
+        if (idx >= 0 && idx < items.length) return items[idx];
+      }
+      let hit = null;
+      try { hit = items.find((el) => cat.itemTitle(el) === s) || null; } catch (e) { /* 忽略 */ }
+      if (hit) return hit;
+      try { hit = items.find((el) => (cat.itemTitle(el) || '').includes(s)) || null; } catch (e) { /* 忽略 */ }
+      return hit;
+    },
+  };
+
+  ZHS.Scheduler = Scheduler;
+})();
+
+/* ===== 06-panel.js ===== */
+/**
+ * 顺序播放面板（外观层）
+ *
+ * 本文件只做「界面 + 启停 + 设置」，刷课逻辑全部来自 GitHub 项目
+ * huanweide/zhihuishu-helper（MIT）的其它模块，没有改动它们的判断流程。
+ *
+ * 原项目的面板是一整套大 UI，这里按用户要求换成与「学习通版」一致的
+ * 深色小面板：标题 + 启动/停止 + 状态行 + 进度条 + 最近 4 条日志 + ⚙ 设置 + ▼ 收起。
+ *
+ * 其它模块仍按原项目的接口调用本面板，因此必须保留：
+ *   mount() / refresh() / onLog(entry) / alert(msg, type, timeout) / showReport(report)
+ *
+ * 注意：面板和设置都放在 Shadow DOM 里。原项目也是这么做的，原因不只是样式隔离：
+ * 引擎里有多处 document.querySelectorAll('*') 的兜底扫描（例如识别安全验证文字、
+ * 自动嗅探课时列表）。面板若用普通 DOM，它显示的日志文字（比如「检测到安全验证」）
+ * 会被自己的扫描当成页面状态，造成自我触发；面板里的 div 也可能被当成课时条目。
+ */
+(function () {
+  'use strict';
+  const ZHS = window.ZHS;
+  if (!ZHS || !ZHS.Util) return;
+  if (ZHS.__mod06_panel) return;
+  ZHS.__mod06_panel = true;
+  if (!ZHS.panel) ZHS.panel = {};
+
+  const HOST_ID = 'zhs-seq-panel-host';
+  const PANEL_ID = 'zhs-seq-panel';
+  const CFG_ID = 'zhs-seq-cfg';
+  const POS_KEY = 'zhs-seq-panel-pos';
+  const RUN_KEY = 'zhs-seq-paused';   // true = 用户手动「停止」，下次进页面不自动开跑
+  const MAX_LOGS = 60;
+
+  const st = { logs: [], toast: null, toastUntil: 0, hideLogs: false };
+  let els = null;          // { host, root, box, btn, gear, toggle, toast, status, bar, logs }
+  let timer = null;
+  let drag = null;
+
+  function gmGet(key, def) {
+    try { return typeof GM_getValue === 'function' ? GM_getValue(key, def) : def; } catch (e) { return def; }
+  }
+  function gmSet(key, val) {
+    try { if (typeof GM_setValue === 'function') GM_setValue(key, val); } catch (e) { /* 忽略 */ }
+  }
+  function escHtml(s) {
+    return String(s).replace(/[&<>"]/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch]));
+  }
+  function fmtTime(sec) {
+    sec = Math.max(0, Math.floor(Number(sec) || 0));
+    const m = Math.floor(sec / 60);
+    const s = sec % 60;
+    return (m < 10 ? '0' : '') + m + ':' + (s < 10 ? '0' : '') + s;
+  }
+  function pushLog(text, level) {
+    st.logs.push({ line: String(text == null ? '' : text), level: level || 'info' });
+    if (st.logs.length > MAX_LOGS) st.logs.shift();
+  }
+  function root() { return els && els.root ? els.root : null; }
+  function cfgEl() {
+    const r = root();
+    return r && typeof r.getElementById === 'function' ? r.getElementById(CFG_ID) : null;
+  }
+
+  /* ---------- 状态快照：全部读取原项目已有的公开状态 ---------- */
+  function snapshot() {
+    const out = { running: !!ZHS.state.running, lines: [], percent: null };
+    try {
+      const cat = ZHS.Catalog;
+      const items = cat && typeof cat.items === 'function' ? cat.items() : [];
+      if (items && items.length) {
+        const s = typeof cat.stats === 'function' ? cat.stats() : { done: 0, total: items.length, percent: 0 };
+        out.percent = s.percent;
+        out.lines.push('目录 ' + s.done + '/' + s.total + '（' + s.percent + '%）');
+        const cur = typeof cat.current === 'function' ? cat.current() : null;
+        const title = cur && typeof cat.itemTitle === 'function' ? cat.itemTitle(cur) : '';
+        if (title) out.lines.push('当前：' + String(title).slice(0, 30));
+      } else {
+        out.lines.push('未识别到课程目录（进入具体课程播放页后自动开始）');
+      }
+      const v = ZHS.state.videoEl || (ZHS.Player && ZHS.Player.video ? ZHS.Player.video() : null);
+      if (v && isFinite(v.duration) && v.duration > 0) {
+        out.lines.push('视频 ' + fmtTime(v.currentTime) + ' / ' + fmtTime(v.duration) + (v.paused ? ' · 暂停' : ''));
+      }
+    } catch (e) {
+      out.lines.push('状态读取异常：' + ((e && e.message) || e));
+    }
+    if (ZHS.state.pausedByGuard) out.lines.push('⚠ 安全验证中：请手动完成，脚本会等你');
+    if (ZHS.state.dialogActive) out.lines.push('弹题处理中…');
+    return out;
+  }
+
+  function render() {
+    if (!els) return;
+    const snap = snapshot();
+    els.status.textContent = (snap.running ? '运行中' : '已停止') + '\n' + snap.lines.join('\n');
+    els.btn.textContent = snap.running ? '停止' : '启动';
+    els.btn.style.background = snap.running ? '#2f6f4f' : '#3a4256';
+    const pct = typeof snap.percent === 'number' ? Math.max(0, Math.min(100, snap.percent)) : 0;
+    els.bar.style.width = pct + '%';
+
+    if (st.toast && Date.now() < st.toastUntil) {
+      els.toast.style.display = 'block';
+      els.toast.textContent = st.toast.text;
+      els.toast.style.background = st.toast.bg;
+      els.toast.style.color = st.toast.fg;
+    } else {
+      els.toast.style.display = 'none';
+    }
+
+    const lines = st.logs.slice(-4).map((l) => {
+      const color = l.level === 'ok' ? '#7ee787'
+        : l.level === 'warn' ? '#f0b72f'
+          : l.level === 'err' ? '#f85149' : '#9fb3c8';
+      return '<div style="color:' + color + '">' + escHtml(l.line) + '</div>';
+    });
+    els.logs.innerHTML = lines.join('');
+    els.logs.style.display = st.hideLogs ? 'none' : 'block';
+    els.toggle.textContent = st.hideLogs ? '▲' : '▼';
+  }
+
+  /* ---------- 原项目调用：日志 / 提示 / 总结 ---------- */
+  function onLog(entry) {
+    if (!entry) return;
+    const lvl = entry.level === 'error' ? 'err' : entry.level === 'warn' ? 'warn' : 'info';
+    let t = '';
+    try { t = new Date(entry.t || Date.now()).toLocaleTimeString('zh-CN', { hour12: false }); } catch (e) { /* 忽略 */ }
+    pushLog((t ? '[' + t + '] ' : '') + (entry.text == null ? '' : entry.text), lvl);
+    render();
+  }
+
+  function alertMsg(msg, type, timeout) {
+    const text = String(msg == null ? '' : msg);
+    const kind = String(type || 'info').toLowerCase();
+    const icon = kind === 'error' ? '✖ ' : kind === 'warn' ? '⚠ ' : kind === 'success' ? '✔ ' : 'ℹ ';
+    const theme = kind === 'error' ? { bg: '#4a1f22', fg: '#ffb3b8' }
+      : kind === 'warn' ? { bg: '#4a3a12', fg: '#ffd88a' }
+        : kind === 'success' ? { bg: '#1d3a2a', fg: '#9af0c0' }
+          : { bg: '#1d3a4d', fg: '#a9d4ff' };
+    st.toast = { text: icon + text, bg: theme.bg, fg: theme.fg };
+    st.toastUntil = Date.now() + (Number(timeout) || 5000);
+    render();
+  }
+
+  function showReport(report) {
+    try {
+      if (!report || typeof report !== 'object') return;
+      const g = (k) => (report[k] == null ? '—' : report[k]);
+      const summary = '完成 ' + g('已完成') + '/' + g('总节点')
+        + '，未完成 ' + g('未完成') + '，本次完成 ' + g('本次完成节数') + ' 节';
+      try { console.log('[顺序播放·学习报告]', report); } catch (e) { /* 忽略 */ }
+      pushLog('学习报告：' + summary, 'ok');
+      alertMsg('学习报告：' + summary + '（完整内容见控制台）', 'success', 15000);
+    } catch (e) { /* 报告展示失败不影响主流程 */ }
+  }
+
+  /* ---------- 启停 ---------- */
+  function toggleRun() {
+    const running = !!ZHS.state.running;
+    if (running) {
+      gmSet(RUN_KEY, true);
+      window.__ZHS_SEQ_PAUSED__ = true;
+      try { if (ZHS.Scheduler && ZHS.Scheduler.stop) ZHS.Scheduler.stop('user'); } catch (e) { /* 忽略 */ }
+      pushLog('⏸ 已停止：当前任务处理完不再继续', 'warn');
+    } else {
+      gmSet(RUN_KEY, false);
+      window.__ZHS_SEQ_PAUSED__ = false;
+      try { if (ZHS.Scheduler && ZHS.Scheduler.start) ZHS.Scheduler.start({ manual: true }); } catch (e) { /* 忽略 */ }
+      pushLog('▶ 已启动', 'ok');
+    }
+    render();
+  }
+
+  /* ---------- 设置 ---------- */
+  function closeCfg() {
+    const old = cfgEl();
+    if (old) old.remove();
+  }
+
+  function showConfigUI() {
+    if (cfgEl()) { closeCfg(); return; }
+    if (!root()) mount();
+    const r = root();
+    if (!r) return;
+
+    const cfg = ZHS.config || {};
+    const sw = (key, title, desc) => '<div style="margin:8px 0;border-bottom:1px solid #2c3446;padding-bottom:8px">'
+      + '<div style="font-weight:600">' + title + '</div>'
+      + '<label><input type="checkbox" data-cfg="' + key + '"' + (cfg[key] ? ' checked' : '') + '> 开启</label>'
+      + (desc ? '<div style="font-size:11px;color:#8a97a8;margin-top:3px;line-height:1.5">' + desc + '</div>' : '')
+      + '</div>';
+
+    const speed = Number(cfg.speed) || 1;
+    let html = '<div style="font-weight:600;margin-bottom:8px">顺序播放 · 设置</div>';
+    html += '<div style="margin:8px 0;border-bottom:1px solid #2c3446;padding-bottom:8px">'
+      + '<div style="font-weight:600">视频倍速</div>'
+      + '<select id="zhsSeqSpeed">'
+      + [1, 1.25, 1.5].map((v) => '<option value="' + v + '"' + (Math.abs(v - speed) < 0.001 ? ' selected' : '') + '>' + v + 'x</option>').join('')
+      + '</select>'
+      + '<div style="font-size:11px;color:#8a97a8;margin-top:3px;line-height:1.5">1x 最稳；平台上限 1.5x，再高容易触发风控</div>'
+      + '</div>';
+    html += sw('autoPlay', '自动播放', '视频暂停后自动继续');
+    html += sw('autoNext', '自动进入下一节', '本节看完后自动切换');
+    html += sw('skipFinished', '跳过已完成', '已打勾的节点直接略过');
+    html += sw('mute', '静音播放', '避免外放打扰');
+    html += sw('autoAnswer', '视频弹题：自动选一个', '不联网、不接 AI，用本地规则推测；只为让视频继续播，答案不保证正确');
+    html += sw('gatedRandom', '答不出时随机选（保进度）', '连本地推测都没有把握时也选一个，避免卡住；可能答错，答错一般不影响视频进度');
+    html += sw('humanPause', '拟人随机暂停', '每隔一段时间随机停 30–90 秒，降低挂机特征');
+    html += sw('autoLearn', '课程中心自动选课', '默认关闭：只在你自己打开的课程里顺序播放，不自动跳别的课');
+    html += sw('debug', '控制台详细日志', '排查问题时再开');
+    html += '<div style="display:flex;justify-content:flex-end;gap:8px;margin-top:10px">'
+      + '<button id="zhsSeqCfgClose" type="button">关闭</button>'
+      + '<button id="zhsSeqCfgSave" type="button">保存</button></div>';
+
+    const p = document.createElement('div');
+    p.id = CFG_ID;
+    p.style.cssText = 'position:fixed;right:16px;bottom:310px;z-index:2147483647;width:300px;box-sizing:border-box;'
+      + 'background:#1f2430;color:#e6e9ef;border:1px solid #2c3446;border-radius:10px;padding:12px;'
+      + 'font:12px/1.7 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif;box-shadow:0 6px 24px rgba(0,0,0,.4)';
+    p.innerHTML = html;
+    r.appendChild(p);
+
+    const sel = p.querySelector('#zhsSeqSpeed');
+    if (sel) sel.style.cssText = 'box-sizing:border-box;background:#2c3446;color:#e6e9ef;border:1px solid #3a4256;border-radius:6px;padding:3px 6px;font:inherit';
+    p.querySelectorAll('button').forEach((b) => {
+      b.style.cssText = 'font:inherit;border:0;border-radius:6px;padding:5px 12px;cursor:pointer;background:#3a4256;color:#e6e9ef';
+    });
+
+    const closeBtn = p.querySelector('#zhsSeqCfgClose');
+    if (closeBtn) closeBtn.addEventListener('click', closeCfg);
+    const saveBtn = p.querySelector('#zhsSeqCfgSave');
+    if (saveBtn) {
+      saveBtn.addEventListener('click', () => {
+        const patch = {};
+        p.querySelectorAll('input[data-cfg]').forEach((i) => { patch[i.dataset.cfg] = !!i.checked; });
+        const sp = p.querySelector('#zhsSeqSpeed');
+        if (sp) patch.speed = Number(sp.value) || 1;
+        // 「课程中心自动选课」是一个总开关：三个相关配置一起改，避免只开一半导致手动「找下一门课」被拒
+        if (Object.prototype.hasOwnProperty.call(patch, 'autoLearn')) {
+          patch.autoCoursePick = patch.autoLearn;
+          patch.autoCourseHop = patch.autoLearn;
+        }
+        try { if (typeof ZHS.setConfig === 'function') ZHS.setConfig(patch); } catch (e) { /* 忽略 */ }
+        if (ZHS.Log && ZHS.Log.info) {
+          ZHS.Log.info('设置已保存：倍速 ' + patch.speed + 'x，弹题自动处理=' + (patch.autoAnswer ? '开' : '关'));
+        } else {
+          pushLog('设置已保存：倍速 ' + patch.speed + 'x', 'ok');
+        }
+        closeCfg();
+      });
+    }
+  }
+
+  /* ---------- 挂载 / 拖动 / 自动刷新 ---------- */
+  function mkBtn(text, title) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.textContent = text;
+    if (title) b.title = title;
+    b.style.cssText = 'font:inherit;font-size:11px;border:0;border-radius:6px;padding:3px 8px;cursor:pointer;background:#3a4256;color:#e6e9ef;line-height:1.4';
+    return b;
+  }
+
+  function restorePos(box) {
+    try {
+      const raw = gmGet(POS_KEY, '');
+      if (!raw) return;
+      const pos = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      if (!pos || !isFinite(pos.left) || !isFinite(pos.top)) return;
+      const left = Math.max(0, Math.min(Math.max(0, window.innerWidth - 80), Number(pos.left)));
+      const top = Math.max(0, Math.min(Math.max(0, window.innerHeight - 40), Number(pos.top)));
+      box.style.left = left + 'px';
+      box.style.top = top + 'px';
+      box.style.right = 'auto';
+      box.style.bottom = 'auto';
+    } catch (e) { /* 位置数据损坏时用默认位置 */ }
+  }
+
+  function savePos() {
+    if (!els) return;
+    try {
+      const r = els.box.getBoundingClientRect();
+      gmSet(POS_KEY, JSON.stringify({ left: Math.round(r.left), top: Math.round(r.top) }));
+    } catch (e) { /* 忽略 */ }
+  }
+
+  function mount() {
+    if (els && els.host && document.contains(els.host)) { render(); return; }
+    if (els) {
+      try { if (els.host) els.host.remove(); } catch (e) { /* 忽略 */ }
+      els = null;
+    }
+
+    const host = document.createElement('div');
+    host.id = HOST_ID;
+    // 宿主本身不占布局；面板用 fixed 贴在视口右下角。
+    host.style.cssText = 'all:initial;position:fixed;left:0;top:0;width:0;height:0;z-index:2147483647';
+    const shadow = host.attachShadow({ mode: 'open' });
+
+    // Shadow DOM 内只需重置继承，具体样式都写在元素上，和页面 CSS 完全隔离。
+    const style = document.createElement('style');
+    style.textContent = ':host{all:initial}.zhs-wrap{all:initial}';
+    shadow.appendChild(style);
+
+    const box = document.createElement('div');
+    box.id = PANEL_ID;
+    box.className = 'zhs-wrap';
+    box.style.cssText = 'position:fixed;right:16px;bottom:16px;z-index:2147483647;width:250px;box-sizing:border-box;'
+      + 'background:#1f2430;color:#e6e9ef;border-radius:10px;padding:10px 12px;'
+      + 'font:12px/1.6 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif;'
+      + 'box-shadow:0 6px 24px rgba(0,0,0,.35)';
+
+    const hd = document.createElement('div');
+    hd.style.cssText = 'display:flex;align-items:center;justify-content:space-between;gap:6px;margin-bottom:6px';
+
+    const title = document.createElement('span');
+    title.textContent = '顺序播放';
+    title.title = '按住可拖动面板 · 知到/智慧树';
+    title.style.cssText = 'font-weight:600;cursor:move;user-select:none';
+
+    const right = document.createElement('div');
+    right.style.cssText = 'display:flex;gap:4px;align-items:center';
+    const btn = mkBtn('启动', '启动 / 停止');
+    const gear = mkBtn('⚙', '设置');
+    const toggle = mkBtn('▼', '展开 / 收起日志');
+    right.appendChild(btn);
+    right.appendChild(gear);
+    right.appendChild(toggle);
+    hd.appendChild(title);
+    hd.appendChild(right);
+
+    const toast = document.createElement('div');
+    toast.style.cssText = 'display:none;margin:4px 0 6px;padding:5px 8px;border-radius:6px;font-size:11px;line-height:1.5;word-break:break-word';
+
+    const status = document.createElement('div');
+    status.style.cssText = 'opacity:.9;white-space:pre-wrap;word-break:break-word;min-height:2.6em';
+
+    const barOuter = document.createElement('div');
+    barOuter.style.cssText = 'height:4px;background:#3a4256;border-radius:2px;margin-top:7px;overflow:hidden';
+    const bar = document.createElement('i');
+    bar.style.cssText = 'display:block;height:100%;width:0;background:#5b9dd9;transition:width .3s';
+    barOuter.appendChild(bar);
+
+    const logs = document.createElement('div');
+    logs.style.cssText = 'margin-top:8px;max-height:72px;overflow-y:auto;font-size:11px;line-height:1.5;'
+      + 'border-top:1px solid #2c3446;padding-top:6px;display:block';
+
+    box.appendChild(hd);
+    box.appendChild(toast);
+    box.appendChild(status);
+    box.appendChild(barOuter);
+    box.appendChild(logs);
+    shadow.appendChild(box);
+
+    (document.body || document.documentElement).appendChild(host);
+    els = { host, root: shadow, box, btn, gear, toggle, toast, status, bar, logs };
+
+    hd.addEventListener('mousedown', (ev) => {
+      if (ev.target.closest('button')) return;
+      ev.preventDefault();
+      const r = box.getBoundingClientRect();
+      drag = { x: ev.clientX, y: ev.clientY, left: r.left, top: r.top };
+      box.style.left = r.left + 'px';
+      box.style.top = r.top + 'px';
+      box.style.right = 'auto';
+      box.style.bottom = 'auto';
+    });
+    btn.addEventListener('click', toggleRun);
+    gear.addEventListener('click', showConfigUI);
+    toggle.addEventListener('click', () => { st.hideLogs = !st.hideLogs; render(); });
+
+    restorePos(box);
+
+    // 把面板出现之前的近几条日志补上，避免首屏空白
+    try {
+      if (ZHS.Log && typeof ZHS.Log.all === 'function') {
+        const recent = ZHS.Log.all().slice(-8);
+        for (const e of recent) {
+          const lvl = e.level === 'error' ? 'err' : e.level === 'warn' ? 'warn' : 'info';
+          let t = '';
+          try { t = new Date(e.t || Date.now()).toLocaleTimeString('zh-CN', { hour12: false }); } catch (e2) { /* 忽略 */ }
+          pushLog((t ? '[' + t + '] ' : '') + e.text, lvl);
+        }
+      }
+    } catch (e) { /* 忽略 */ }
+
+    render();
+    if (!timer) {
+      timer = setInterval(() => {
+        try { render(); } catch (e) { /* 单次刷新失败不中断 */ }
+      }, 1000);
+    }
+  }
+
+  document.addEventListener('mousemove', (ev) => {
+    if (!drag || !els) return;
+    els.box.style.left = (drag.left + ev.clientX - drag.x) + 'px';
+    els.box.style.top = (drag.top + ev.clientY - drag.y) + 'px';
+  });
+  document.addEventListener('mouseup', () => {
+    if (!drag) return;
+    drag = null;
+    savePos();
+  });
+
+  function refresh() {
+    if (!els || !els.host || !document.contains(els.host)) { mount(); return; }
+    render();
+  }
+
+  /* ---------- 对其它模块暴露的接口（与原项目一致） ---------- */
+  Object.assign(ZHS.panel, {
+    mount,
+    refresh,
+    onLog,
+    alert: alertMsg,
+    showReport,
+    _shadow: null,   // 兼容原项目的存在性判断；本面板用 Shadow DOM，内部节点不暴露给页面
+  });
+  ZHS.__panel_ready = true;
+
+  // 记住上次的「停止」状态：07-main 会用这个标记决定进页面后是否自动开跑
+  try {
+    window.__ZHS_SEQ_PAUSED__ = !!gmGet(RUN_KEY, false);
+  } catch (e) {
+    window.__ZHS_SEQ_PAUSED__ = false;
+  }
+
+  // 先挂一次：即使后续模块初始化失败，用户也能看到面板
+  try { mount(); } catch (e) { /* 面板失败不阻塞主流程 */ }
+})();
+
+/* ===== 06b-course-hub.js ===== */
+/**
+ * 课程中心调度：自动选课 + 自动跳课
+ *
+ * 解决的问题：
+ *   1. 自动选课 —— 在课程中心页自动找到「未看完」的课程并点进去
+ *   2. 自动跳课 —— 当前课程全部学完后，自动回课程中心找下一门继续
+ *
+ * 跨页机制：
+ *   油猴 match 覆盖 *://*.polymas.com/*，新标签页会自动注入本脚本；
+ *   GM 存储跨标签页/跨子域共享，所以用 intent（跳转意图）串起两页。
+ *
+ * 存储用 GM_setValue（跨页共享），无 GM 环境降级到 localStorage，
+ * 与 04-resume.js 的读写范式保持一致。
+ */
+(function () {
+  'use strict';
+  const ZHS = window.ZHS;
+  if (!ZHS || !ZHS.Util) return;
+  // 重入守卫：SPA 二次注入时整个模块直接退出，避免定时器/监听器叠加
+  if (ZHS.__mod06b_course_hub) return;
+  ZHS.__mod06b_course_hub = true;
+  const U = ZHS.Util;
+
+  const STORE_KEY = 'zhs-helper-hub';
+  const hasGM = typeof GM_setValue === 'function' && typeof GM_getValue === 'function';
+
+  // 课程中心页地址（自动跳课从这里出发，也回到这里）
+  const HUB_URL = 'https://hike-teaching-center.polymas.com/stu-hike/agent-course-hike/ai-course-center';
+  // 课程学习页路径前缀（进入课程后 URL 形如 {BASE}/AIstudent/{courseId}/{classId}?key=entry）
+  const STUDENT_PATH = '/AIstudent/';
+
+  const INTENT_TTL = 10 * 60 * 1000;   // 跳转意图有效期：10 分钟
+  const LIST_MAX = 50;                 // doneCourses / failedCourses 各自上限（FIFO 淘汰）
+
+  // 防重入标志：MutationObserver 可能反复触发扫描，同轮内不重复收集
+  let _scanning = false;
+  let _scanPromise = null;      // in-flight 扫描 Promise，供并发调用共享结果
+
+  // ============ 会话库读写（照 04-resume.js 范式）============
+
+  function emptyStore() {
+    return {
+      rev: 1,
+      intent: null,
+      doneCourses: [],
+      failedCourses: [],
+      stats: { hopped: 0, failed: 0 },
+    };
+  }
+
+  function readStore() {
+    try {
+      const raw = hasGM ? GM_getValue(STORE_KEY, null) : localStorage.getItem(STORE_KEY);
+      if (!raw) return emptyStore();
+      let obj = typeof raw === 'string' ? JSON.parse(raw) : raw;
+      // 老格式兼容：历史版本曾把「已完成课程」直接存成纯字符串数组。
+      // 若原样返回数组，后续 store.doneCourses 取到 undefined（靠 || [] 兜住），
+      // 功能虽不崩，但 read() 的类型契约被破坏（返回数组而非对象）。这里统一转成对象。
+      if (Array.isArray(obj)) {
+        obj = { rev: 1, intent: null, doneCourses: obj.slice(), failedCourses: [], stats: { hopped: 0, failed: 0 } };
+      }
+      if (!obj || typeof obj !== 'object') return emptyStore();
+      // 逐字段兜底，防止老版本/损坏数据让后续逻辑崩掉
+      if (!Array.isArray(obj.doneCourses)) obj.doneCourses = [];
+      if (!Array.isArray(obj.failedCourses)) obj.failedCourses = [];
+      if (!obj.stats || typeof obj.stats !== 'object') obj.stats = { hopped: 0, failed: 0 };
+      if (typeof obj.stats.hopped !== 'number') obj.stats.hopped = 0;
+      if (typeof obj.stats.failed !== 'number') obj.stats.failed = 0;
+      obj.rev = 1;
+      return obj;
+    } catch (e) {
+      ZHS.Log.warn('课程中心会话库损坏，已重置');
+      return emptyStore();
+    }
+  }
+
+  function writeStore(store) {
+    try {
+      const raw = JSON.stringify(store);
+      if (hasGM) GM_setValue(STORE_KEY, raw);
+      else localStorage.setItem(STORE_KEY, raw);
+      return true;
+    } catch (e) {
+      ZHS.Log.warn('课程中心会话库写入失败：' + e.message);
+      return false;
+    }
+  }
+
+  /** FIFO 入列：超出上限时丢最早的，避免列表无限膨胀 */
+  function pushList(arr, val) {
+    if (!val) return;
+    const i = arr.indexOf(val);
+    if (i >= 0) arr.splice(i, 1);   // 已存在则移到队尾（刷新位置）
+    arr.push(val);
+    while (arr.length > LIST_MAX) arr.shift();
+  }
+
+  // ============ 页面判定 ============
+
+  /** 是否在课程中心页 */
+  function isHubPage() {
+    try {
+      // round-8 M4：pathname / search / hash 任一含课程中心标识即判定命中，抗 query/hash 路由与大小写变化
+      const p = (location.pathname || '').toLowerCase();
+      const s = ((location.search || '') + (location.hash || '')).toLowerCase();
+      return p.includes('ai-course-center') || s.includes('ai-course-center');
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /** 是否在课程学习页 */
+  function isStudentPage() {
+    try {
+      return location.pathname.includes(STUDENT_PATH);
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // ============ 意图读写 ============
+
+  /**
+   * 写跳转意图（点击卡片前必须先写，新标签页靠它认领）
+   *
+   * via 记录本次意图的来源，是「能不能自动点课」的授权凭证：
+   *   'auto-hop' —— 来自「上一门课学完后自动跳转」，说明用户已授权自动跳课链 → 可自动选课
+   *   'manual'   —— 用户手动触发
+   * 只有 via === 'auto-hop' 时，课程中心页才会自动选课（见 onPageReady）。
+   * 普通「用户自己打开课程中心」不写 intent，因此不会被自动点课。
+   */
+  function setIntent(courseId, courseName, via) {
+    const store = readStore();
+    store.intent = {
+      courseId: courseId || courseName || null,
+      courseName: courseName || null,
+      via: via || 'manual',
+      at: Date.now(),
+    };
+    writeStore(store);
+    return store.intent;
+  }
+
+  /** 读未过期的跳转意图；过期的顺手清掉 */
+  function getIntent() {
+    const store = readStore();
+    const it = store.intent;
+    if (!it) return null;
+    // at 必须是有限数字，否则视为过期。
+    // 起因：at 被写成字符串 "abc" 时，Date.now() - "abc" = NaN，
+    // 而 `NaN > TTL` 恒为 false → 旧判断永远「不过期」，脏意图会长期残留、
+    // 一旦用户后来打开自动选课就会用陈旧意图劫持点击。
+    const at = Number(it.at);
+    if (!Number.isFinite(at) || (Date.now() - at) > INTENT_TTL) {
+      // 用 info：debug 已不进面板缓冲，而「意图过期」是排查
+      // 「为什么没自动选课」的关键线索，必须留在面板可查。
+      ZHS.Log.info('课程中心跳转意图已过期，忽略');
+      store.intent = null;
+      writeStore(store);
+      return null;
+    }
+    return it;
+  }
+
+  /** 清除跳转意图 */
+  function clearIntent() {
+    const store = readStore();
+    if (!store.intent) return false;
+    store.intent = null;
+    writeStore(store);
+    return true;
+  }
+
+  // ============ 课程卡片收集（处理虚拟滚动）============
+
+  /**
+   * 收集课程卡片。
+   *
+   * 难点：课程中心是虚拟滚动，卡片只有滚到可视区才补渲，
+   * 所以必须「边滚边收」。滚动容器就是页面主体，
+   * 做法是：先记原位 → 反复滚到底收集 → 直到 scrollHeight 不再增长或超上限 → 恢复原位。
+   *
+   * 【防卡死】除了「最多 30 轮」，还必须有**总时长上限**。
+   * 某些环境（无头/无布局引擎）scrollHeight 恒为 0，导致「到底了没」永远判不出来，
+   * 只能靠次数上限兜底 —— 30 轮 × 300ms ≈ 9 秒，用户会以为脚本卡住。
+   * 现在超时（默认 4 秒）即停，并且一旦确认高度不再变化就提前收工。
+   */
+  async function collectCards() {
+    const found = [];
+    const startedAt = Date.now();
+    const MAX_MS = 4000;        // 总时长硬上限，防 scrollHeight 恒 0 时空转
+    const ROUND_MS = 300;       // 每轮等平台补渲
+
+    // 找滚动容器：优先文档主体，找不到就退化为 window
+    const scroller = findScroller();
+
+    const originTop = scroller ? scroller.scrollTop : 0;
+    let lastHeight = -1;
+    let stable = 0;
+
+    try {
+      for (let i = 0; i < 30; i++) {   // 次数上限 30，防死循环
+        if (Date.now() - startedAt > MAX_MS) {
+          ZHS.Log.debug('[课程中心] 滚动收集达到时长上限，提前结束（已收 ' + found.length + ' 张）');
+          break;
+        }
+
+        const curHeight = scroller ? scroller.scrollHeight : document.documentElement.scrollHeight;
+        if (scroller) scroller.scrollTop = curHeight;   // 滚到底触发补渲
+        else window.scrollTo(0, curHeight);
+
+        await U.sleep(ROUND_MS);   // 等平台补渲
+
+        collectInto(found);
+
+        const newHeight = scroller ? scroller.scrollHeight : document.documentElement.scrollHeight;
+        // 高度读不出来（恒 0 / NaN）→ 无法判断是否到底，直接收工，避免空转
+        if (!newHeight) {
+          ZHS.Log.debug('[课程中心] 滚动高度不可读，跳过虚拟滚动收集（当前页面可能无需滚动）');
+          break;
+        }
+        if (newHeight === curHeight && newHeight === lastHeight) {
+          stable++;
+          if (stable >= 2) break;   // 连续两轮高度不变 → 到底了
+        } else {
+          stable = 0;
+        }
+        lastHeight = newHeight;
+      }
+    } catch (e) {
+      ZHS.Log.warn('滚动收集课程卡片出错：' + e.message);
+    } finally {
+      // 恢复原位，不打扰用户
+      try {
+        if (scroller) scroller.scrollTop = originTop;
+        else window.scrollTo(0, originTop);
+      } catch (e) { /* 忽略 */ }
+    }
+
+    // 回到顶部后再补收一次，防止一开始顶部有漏网
+    collectInto(found);
+    return found;
+  }
+
+  /** 依次尝试多个选择器，返回第一个命中的单元素（带兜底，抗平台改类名） */
+  function qsFirst(sels) {
+    for (const s of sels) {
+      try { const el = document.querySelector(s); if (el) return el; } catch (e) {}
+    }
+    return null;
+  }
+  /** 依次尝试多个选择器，合并返回所有命中（去重，抗平台改类名） */
+  function qsaAll(sels) {
+    const out = [];
+    for (const s of sels) {
+      try {
+        const els = document.querySelectorAll(s);
+        for (const el of els) if (out.indexOf(el) < 0) out.push(el);
+      } catch (e) {}
+    }
+    return out;
+  }
+
+  /** 找虚拟滚动的容器 */
+  function findScroller() {
+    try {
+      const body = qsFirst(['.ai-course-center-body', '[class*="course-center"]']);
+      if (body) {
+        // 自身可滚就用自己，否则向上找可滚祖先
+        if (body.scrollHeight > body.clientHeight) return body;
+        let p = body.parentElement;
+        while (p && p !== document.body) {
+          if (p.scrollHeight > p.clientHeight) return p;
+          p = p.parentElement;
+        }
+      }
+      const de = document.documentElement;
+      if (de && de.scrollHeight > de.clientHeight) return de;
+    } catch (e) { /* 忽略 */ }
+    return null;
+  }
+
+  /** 把当前 DOM 里的卡片解析后并入结果（按元素去重） */
+  function collectInto(found) {
+    let cards = [];
+    try {
+      cards = qsaAll(['.ai-course-center-body div.course-card', '[class*="course-card"]', '[class*="courseCard"]']);
+    } catch (e) {
+      ZHS.Log.warn('课程卡片选择器匹配失败：' + e.message);
+      return;
+    }
+    for (const el of cards) {
+      if (found.some((c) => c.el === el)) continue;   // 去重
+      const parsed = parseCard(el);
+      if (parsed) found.push(parsed);
+    }
+  }
+
+  /** 解析单张卡片 → { el, name, percent, finished } */
+  function parseCard(el) {
+    if (!el) return null;
+    let name = '';
+    try {
+      const h4 = el.querySelector('h4');
+      name = U.normText(h4 ? (h4.innerText || h4.textContent) : '');
+      if (!name) name = U.normText(el.textContent).slice(0, 60);   // 降级
+    } catch (e) {
+      name = '';
+    }
+
+    let percent = null;
+    let text = '';
+    try {
+      text = U.normText(el.textContent);
+      // 百分比解析：优先在「自身文本含 %」的最小元素上解析，
+      // 避免整卡 textContent 拼接把相邻数字吞进来（如 "课4" + "12.5%" = "课412.5%"，
+      // 直接在合并文本上匹配会得到 412.5）。逐个候选元素单独解析，取第一个命中。
+      // 修复四个毛病：
+      //   1. 支持小数与科学计数法（"12.5%"→12，"1e2%"→100），不再只吃 \d+
+      //   2. 保留正负号（"-5%"→-5）
+      //   3. 正则锚定 `%` 前的数字 token，不跨界吞数字
+      //   4. 上限夹逼到 100（"1000%"→100，避免 finished 误判）
+      const RE = /([+-]?\d*\.?\d+(?:e[+-]?\d+)?)\s*%/i;
+      const cands = [];
+      try {
+        const nodes = el.querySelectorAll('*');
+        for (const n of nodes) {
+          const t = U.normText(n.textContent);
+          if (t.indexOf('%') >= 0) cands.push(t);
+        }
+      } catch (e) { /* 忽略 */ }
+      cands.push(text);   // 兜底：整卡文本
+      for (const t of cands) {
+        const m = t.match(RE);
+        if (m) {
+          const n = Number(m[1]);
+          if (Number.isFinite(n)) { percent = Math.min(100, Math.floor(n)); break; }
+        }
+      }
+    } catch (e) { /* 忽略 */ }
+
+    // 完成阈值与目录 isFinished 同源（ZHS.Const.FINISH_PCT；2026-10-06 由 98 下调到 91）：
+    // 否则卡在 91~97% 的课程在中心页仍判「未完成」→ 被反复重新进入，形成「中心页↔该课」死循环（round-7 H3）
+    const FINISH_PCT = (ZHS.Const && ZHS.Const.FINISH_PCT) || 91;
+    const finished = (percent !== null && percent >= FINISH_PCT)
+      || text.includes('已完成') || text.includes('已学完');
+
+    return { el, name, percent, finished };
+  }
+
+  /** 从卡片元素上尽量挖出课程标识（data 属性 / vue 实例） */
+  function cardIdentity(el) {
+    if (!el) return null;
+    try {
+      for (const attr of ['data-course-id', 'data-courseid', 'data-id', 'data-key', 'id']) {
+        const v = el.getAttribute && el.getAttribute(attr);
+        if (v) return String(v);
+      }
+      // Vue 实例上常见的字段
+      const vm = el.__vue__ || (el.parentElement && el.parentElement.__vue__);
+      if (vm) {
+        const c = vm.course || vm.courseInfo || vm.data || vm.item;
+        const id = c && (c.courseId || c.courseid || c.id || c.recruitAndCourseId);
+        if (id) return String(id);
+        if (vm.courseId) return String(vm.courseId);
+      }
+    } catch (e) { /* 忽略 */ }
+    return null;
+  }
+
+  // ============ 选择下一门课 ============
+
+  /**
+   * 挑选下一门未看完的课。
+   * 过滤：已 done、已 failed、finished === true。
+   * @returns 卡片对象，或 null（没有可进的课）
+   */
+  async function pickNext() {
+    if (!ZHS.config.autoCoursePick) {
+      ZHS.Log.debug('自动选课开关关闭，跳过');
+      return null;
+    }
+
+    // 防重入：MutationObserver 可能反复触发，同一轮不重复扫描。
+    // 关键：第二次调用不能立即返回 null —— 那会被上层误判成「没有未看完的课程」
+    // 并弹出误导提示。正确做法是 await 第一轮的 in-flight Promise，共享同一结果。
+    if (_scanning) {
+      ZHS.Log.debug('已有扫描进行中，等待其完成后共享结果');
+      try { return await _scanPromise; } catch (e) { return null; }
+    }
+    _scanning = true;
+    let _resolveScan;
+    _scanPromise = new Promise((r) => { _resolveScan = r; });
+
+    const store = readStore();
+    try {
+      ZHS.Log.debug('[课程中心] 开始收集课程卡片…');
+      const cards = await collectCards();
+      ZHS.Log.debug('[课程中心] 共收集到 ' + cards.length + ' 门课程');
+
+      const done = store.doneCourses || [];
+      const failed = store.failedCourses || [];
+
+      for (const c of cards) {
+        if (c.finished) continue;
+        const id = cardIdentity(c.el);
+        const key = id || c.name;
+        if (!key) continue;
+        if (done.includes(key)) continue;
+        if (failed.includes(key)) continue;
+        ZHS.Log.info('[课程中心] 选中未看完课程：' + (c.name || key)
+          + (c.percent !== null ? '（' + c.percent + '%）' : ''));
+        if (_resolveScan) _resolveScan(c);
+        return c;
+      }
+
+      ZHS.Log.info('[课程中心] 没有找到未看完的课程');
+      if (_resolveScan) _resolveScan(null);
+      return null;
+    } catch (e) {
+      ZHS.Log.warn('[课程中心] 挑选课程出错：' + e.message);
+      if (_resolveScan) _resolveScan(null);
+      return null;
+    } finally {
+      _scanning = false;   // 释放防重入标志
+      _scanPromise = null;
+    }
+  }
+
+  // ============ 进入课程 ============
+
+  /**
+   * 进入指定课程卡片。
+   *
+   * 卡片内没有 a[href]，整卡可点，点击后平台自己调 window.open() 新开标签。
+   * 因此必须【先写 intent 再点】，否则新标签页不认领。
+   * 若 window.open 被浏览器拦截，800ms 内没跳转则尝试直接 location.href 兜底。
+   */
+  async function enterCourse(card) {
+    if (!card || !card.el) {
+      ZHS.Log.warn('[课程中心] 进入课程失败：卡片为空');
+      return false;
+    }
+    const id = cardIdentity(card.el) || card.name;
+    if (!id) {
+      ZHS.Log.warn('[课程中心] 卡片没有可用标识，无法记录意图');
+      return false;
+    }
+
+    // 1. 先写 intent（新标签页靠它认领这次跳转）
+    setIntent(id, card.name, card.via || 'manual');
+    ZHS.Log.info('[课程中心] 准备进入课程：' + (card.name || id));
+
+    // 2. 点击卡片
+    //
+    // 【稳健性】不能把「可见性检测失败」当成「不能点」。
+    // U.isVisible() 依赖 offsetParent 等布局信息，在无布局环境（含部分虚拟滚动容器、
+    // 无头/嵌入式浏览器）会误报 false。此时若直接放弃点击，功能就废了。
+    // 策略：可见就当可点直接点；不可见先尝试滚入视口，仍失败则【照样点一次】，
+    // 点不通再由 catch 判定为真失败。
+    let clicked = false;
+    try {
+      const visible = (() => {
+        try { return U.isVisible(card.el); } catch (e) { return true; }
+      })();
+
+      if (!visible) {
+        try {
+          card.el.scrollIntoView({ block: 'center' });
+          await U.sleep(200);
+        } catch (e) {
+          ZHS.Log.debug('[课程中心] scrollIntoView 不可用，直接尝试点击');
+        }
+      }
+
+      card.el.click();
+      clicked = true;
+    } catch (e) {
+      // 第一次点击失败 → 再试一次内部更具体的可点元素
+      ZHS.Log.warn('[课程中心] 直接点击卡片出错（' + e.message + '），尝试内部元素');
+      try {
+        const inner = card.el.querySelector('h4, [class*="btn"], a, button') || card.el;
+        inner.click();
+        clicked = true;
+      } catch (e2) {
+        ZHS.Log.warn('[课程中心] 点击卡片仍失败：' + e2.message);
+      }
+    }
+    // 3. 判定结果
+    //
+    // 【重要纠错】不能用 `isHubPage()` 判断「跳转成功与否」：
+    // 卡片点击走 window.open 开【新标签】，当前页永远还停在课程中心，
+    // 所以 isHubPage() 恒为 true —— 早先版本因此恒返回 false，
+    // 上层收到 false 就 markCourseFailed，把一门本来能学的课永久拉黑。
+    //
+    // 正确语义：click 未抛异常 + intent 已写入 = 已成功发出进入请求 → 返回 true。
+    // 「到底进没进去」的唯一可信信号是学习页那边的 settleIntentOnStudentPage() 回写，
+    // 不在这里猜。宁可返回 true（不动），也不误判成 false（误拉黑）。
+    if (!clicked) {
+      ZHS.Log.warn('[课程中心] 卡片点击未生效（元素不可点），本次进入放弃。不拉黑该课程，稍后可重试');
+      clearIntent();
+      return false;
+    }
+
+    // 已发出进入请求。不再做兜底 location.href 跳转 ——
+    // 那会与平台的 window.open 叠加，开出两个学习页标签（宁可少开，不可多开）。
+    ZHS.Log.info('[课程中心] 已点击卡片，等待新标签页接管（由学习页回写确认）');
+    bumpStat('hopped');
+    // round-8 M2：记录待确认跳转，防「点击后新标签没起来」导致该课永远不学也不失败（由看门狗清理）
+    try {
+      const st = readStore();
+      st.pendingHop = { courseId: id, at: Date.now(), settled: false };
+      writeStore(st);
+    } catch (e) {}
+    return true;
+  }
+
+  /** 尽力从卡片推导学习页 URL（保留：供日志提示 / 手动排查用，不再用于自动跳转） */
+  function deriveCourseUrl(el) {
+    if (!el) return null;
+    try {
+      // a) 卡片内直接有链接
+      const a = el.querySelector('a[href]');
+      if (a && a.href) return a.href;
+      // b) 任意子元素带 href / data-* 属性
+      const cands = [el].concat(Array.from(el.querySelectorAll('*')));
+      for (const node of cands) {
+        for (const attr of ['data-href', 'data-url', 'href', 'data-course-url']) {
+          const v = node.getAttribute && node.getAttribute(attr);
+          if (v && /^https?:|^\//.test(v) && !/ai-course-center/.test(v)) return v;
+        }
+      }
+      // c) Vue 实例上的路由跳转参数
+      const vm = el.__vue__ || (el.parentElement && el.parentElement.__vue__);
+      if (vm) {
+        const c = vm.course || vm.courseInfo || vm.data || vm.item;
+        const courseId = c && (c.courseId || c.courseid || c.recruitAndCourseId || c.id);
+        const classId = c && (c.classId || c.classid);
+        if (courseId && classId) {
+          return location.origin + STUDENT_PATH + courseId + '/' + classId + '?key=entry';
+        }
+      }
+    } catch (e) { /* 忽略 */ }
+    return null;
+  }
+
+  // ============ 统计 / 状态回写 ============
+
+  function bumpStat(field) {
+    const store = readStore();
+    if (!store.stats) store.stats = { hopped: 0, failed: 0 };
+    store.stats[field] = (Number(store.stats[field]) || 0) + 1;
+    writeStore(store);
+  }
+
+  /** 把某课程记为「已全部学完」 */
+  function markCourseDone(courseId) {
+    // round-8 H1：与课程中心 pickNext 读键（cardIdentity）同源，避免「写用 id / 读用另一 id」导致去重失效
+    const key = courseId
+      || (ZHS.state && ZHS.state.hubKey)
+      || (ZHS.state && ZHS.state.courseId);
+    if (!key) {
+      ZHS.Log.warn('[课程中心] markCourseDone 缺少课程标识，忽略');
+      return false;
+    }
+    const store = readStore();
+    pushList(store.doneCourses, String(key));
+    writeStore(store);
+    ZHS.Log.info('[课程中心] 已记录完成课程：' + key);
+    return true;
+  }
+
+  /** 把某课程记为「进入失败」，防止下次再选它形成死循环 */
+  function markCourseFailed(courseId) {
+    // round-8 H1：与 markCourseDone 同源，优先用进入时记录的卡片标识
+    const key = courseId
+      || (ZHS.state && ZHS.state.hubKey)
+      || (ZHS.state && ZHS.state.courseId);
+    if (!key) return false;
+    const store = readStore();
+    pushList(store.failedCourses, String(key));
+    writeStore(store);
+    bumpStat('failed');
+    return true;
+  }
+
+  /**
+   * 跳转回课程中心。
+   * 由 05-scheduler 在「本课程全学完」时调用。
+   *
+   * 关键：这里会写一个 via='auto-hop' 的 intent，作为「用户已授权自动跳课」的凭证。
+   * 课程中心页只有看到这个凭证才会自动选课（见 onPageReady），
+   * 从而区分「学完自动跳下一门」与「用户自己打开课程中心看一眼」两种情形。
+   */
+  function returnToHub() {
+    if (!ZHS.config.autoCourseHop) {
+      ZHS.Log.debug('自动跳课开关关闭，不返回课程中心');
+      return false;
+    }
+    if (isHubPage()) {
+      ZHS.Log.debug('已在课程中心页，无需跳转');
+      return false;
+    }
+    // 写入授权凭证：说明这次回中心是「学完自动跳课」驱动的，可以自动选下一门
+    setIntent(ZHS.state && ZHS.state.courseId, '', 'auto-hop');
+    ZHS.Log.info('[课程中心] 正在返回课程中心寻找下一门课…');
+    try {
+      location.href = HUB_URL;
+      return true;
+    } catch (e) {
+      ZHS.Log.warn('[课程中心] 返回课程中心失败：' + e.message);
+      return false;
+    }
+  }
+
+  /**
+   * 学习页回写闭环：进入课程学习页时，若存在未过期 intent 说明跳转成功，
+   * 清除 intent 并打日志。
+   */
+  function settleIntentOnStudentPage() {
+    if (!isStudentPage()) return false;
+    const it = getIntent();
+    if (!it) return false;
+    // round-8 H1：把进入时记录的卡片标识（与 pickNext 读键同源）存到 state，供 markCourseDone/Failed 写入去重键
+    try { ZHS.state.hubKey = it.courseId || null; } catch (e) {}
+    // round-8 M2：标记待确认跳转已落地，解除看门狗
+    try {
+      const st = readStore();
+      if (st.pendingHop && st.pendingHop.courseId === (it.courseId || '')) {
+        st.pendingHop.settled = true;
+        writeStore(st);
+      }
+    } catch (e) {}
+    clearIntent();
+    ZHS.Log.info('[课程中心] 已进入课程：' + (it.courseName || it.courseId || '未知'));
+    bumpStat('hopped');
+    return true;
+  }
+
+  // ============ 课程中心页主流程 ============
+
+  async function runOnHub(via) {
+    if (!isHubPage()) return false;
+    // round-8 M2：清理卡住的待确认跳转（超过 5 分钟未 settled → 视为进入失败，移出待学防死循环）
+    try {
+      const st = readStore();
+      if (st.pendingHop && !st.pendingHop.settled
+        && Date.now() - (st.pendingHop.at || 0) > 5 * 60 * 1000) {
+        ZHS.Log.warn('[课程中心] 检测到卡住的进入请求（' + st.pendingHop.courseId + '），标记为进入失败');
+        markCourseFailed(st.pendingHop.courseId);
+        st.pendingHop = null;
+        writeStore(st);
+      }
+    } catch (e) {}
+
+    // 等待课程卡片渲染出来（页面可能异步出数据）
+    const first = await waitForCards(15000);
+    if (!first) {
+      ZHS.Log.warn('[课程中心] 未等到课程卡片，跳过自动选课');
+      return false;
+    }
+
+    const next = await pickNext();
+    if (!next) {
+      // 没有可进的课 → 出总结
+      const store = readStore();
+      ZHS.Log.info('[课程中心] 所有课程已无未看完项，本次调度结束'
+        + '（已记录完成 ' + (store.doneCourses || []).length + ' 门）');
+      // 只在「自动跳课链 / 自动学习」里才提示，避免用户随手打开页面就被弹窗打扰
+      if ((via === 'auto-hop' || via === 'auto-learn') && ZHS.panel) {
+        ZHS.panel.alert('课程中心：没有找到未看完的课程，已停止自动选课', 'info', 8000);
+      }
+      return false;
+    }
+
+    // 把本次授权来源带到卡片上，enterCourse 据此写入 intent.via
+    next.via = via || 'manual';
+    const ok = await enterCourse(next);
+    if (!ok) {
+      // 进入失败（卡片不可点 / intent 写不进）→ 记 failed，避免下次继续选它死循环。
+      // 注意：enterCourse 已不再把「判定不了」当成失败，所以这里进来的都是真失败。
+      const id = cardIdentity(next.el) || next.name;
+      markCourseFailed(id);
+      ZHS.Log.warn('[课程中心] 进入课程失败，已加入失败名单：' + (next.name || id));
+    }
+    return ok;
+  }
+
+  /** 等第一张课程卡片出现 */
+  async function waitForCards(timeoutMs) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      try {
+        const el = qsFirst(['.ai-course-center-body div.course-card', '[class*="course-card"]']);
+        if (el) return el;
+      } catch (e) { /* 忽略 */ }
+      await U.sleep(300);
+    }
+    return null;
+  }
+
+  // ============ 对外接口 ============
+
+  const CourseHub = {
+    STORE_KEY,
+    HUB_URL,
+    isHubPage,
+    isStudentPage,
+
+    // 存储
+    read: readStore,
+    write: writeStore,
+    reset() {
+      writeStore(emptyStore());
+      ZHS.Log.info('[课程中心] 会话库已重置');
+    },
+    listDone() { return readStore().doneCourses || []; },
+    listFailed() { return readStore().failedCourses || []; },
+    stats() { return readStore().stats || { hopped: 0, failed: 0 }; },
+
+    /**
+     * v0.6.64 资源遍历：扫描课程中心全部卡片，汇总「还剩多少门未学」。
+     * 供面板「剩余未学课程」展示与 zhs.learn() 决策使用。
+     * 口径与 pickNext 完全一致：finished / 已 done / 已 failed 都不算「未学」。
+     * @returns {Promise<{total:number, unfinished:number, finished:number, doneCount:number, failedCount:number}>}
+     */
+    async summary() {
+      const cards = await collectCards();
+      const store = readStore();
+      const done = store.doneCourses || [];
+      const failed = store.failedCourses || [];
+      let unfinished = 0;
+      let finished = 0;
+      for (const c of cards) {
+        if (c.finished) { finished++; continue; }
+        const id = cardIdentity(c.el) || c.name;
+        if (id && (done.includes(id) || failed.includes(id))) continue;
+        unfinished++;
+      }
+      return {
+        total: cards.length,
+        unfinished,
+        finished,
+        doneCount: done.length,
+        failedCount: failed.length,
+      };
+    },
+
+    // 意图
+    setIntent,
+    getIntent,
+    clearIntent,
+
+    // 卡片
+    collectCards,
+    parseCard,
+
+    // 流程
+    pickNext,
+    enterCourse,
+    markCourseDone,
+    markCourseFailed,
+    returnToHub,
+    settleIntentOnStudentPage,
+    runOnHub,
+
+    /** 启动：根据当前页面决定行为 */
+    async start() {
+      try {
+        if (isHubPage()) {
+          await runOnHub();
+        } else if (isStudentPage()) {
+          settleIntentOnStudentPage();
+        }
+      } catch (e) {
+        ZHS.Log.warn('[课程中心] 启动出错：' + e.message);
+      }
+    },
+
+    /**
+     * 页面加载时的安全入口（替代原来的无条件自启动）。
+     *
+     * 【设计铁律】自动选课绝不能「打开页面就悄悄发生」。
+     * 过去版本在这里无条件 start()，导致用户只是打开课程中心看一眼，
+     * 1.5 秒后课就被点了、还开出新标签 —— 这是劫持用户操作，不可接受。
+     *
+     * 现在只有两种情形才会真正动手：
+     *   A. 跳课链闭环：存在有效 intent 且来源是「上一门课学完后自动跳转」
+     *      （intent.via === 'auto-hop'）→ 说明用户已授权「学完自动跳下一门」这条链
+     *   B. 用户在面板上手动触发（走 triggerManual()）
+     * 其余情况一律只打日志，绝不动手。
+     */
+    async onPageReady() {
+      try {
+        if (isStudentPage()) {
+          // 学习页：认领 intent（这是「跳转成功」的唯一可信信号）
+          settleIntentOnStudentPage();
+          return;
+        }
+        if (!isHubPage()) return;
+
+        // 【关键】先读意图，读完立即消费掉 —— 无论后面走哪条分支。
+        //
+        // 早先版本把这个读取放在「选课开关开启」判断【之后】，导致：
+        // 用户只开「自动跳课」不开「自动选课」时，跳回课程中心后直接从开关分支 return，
+        // intent 永远没被清除、留在存储里成为「僵尸意图」。等用户后来某天打开
+        // 「自动选课」，一进课程中心就会被这个陈旧意图触发自动点课 ——
+        // 严重违背「用户没主动授权时绝不劫持操作」的铁律。
+        //
+        // 现在改为：只要进到课程中心页，先把意图读出来并立刻消费（清除），
+        // 再根据开关与意图来源决定是否动手。纸条用完就撕，绝不留到下次。
+        const it = getIntent();
+        const fromAutoHop = !!(it && it.via === 'auto-hop');
+        if (it) clearIntent();
+
+        if (!ZHS.config.autoCoursePick) {
+          // 用 info：这是用户「为什么没自动选课」的直接答案，必须留在面板可见。
+          ZHS.Log.info('[课程中心] 自动选课开关关闭，不动作（已消费跳转意图，避免残留）');
+          return;
+        }
+
+        // v0.6.64 自动学习总开关：开启则「一进课程中心就自动开始学」，
+        // 不再只依赖 auto-hop 链（旧行为：只有上一门课由本脚本学完跳回时才自动选课）。
+        // 这是用户明确要的「设置默认开启」——开启即全自动。为不静默劫持，
+        // 首次自动选课打 info 日志 + 面板提示，让用户看得见脚本在做什么。
+        // 红线不受影响：只作用于听课链，绝不碰作业/考试页（06c-exam FORBIDDEN）。
+        if (ZHS.config.autoLearn) {
+          ZHS.Log.info('[课程中心] 自动学习已开启，正在选择未学完课程开始学习');
+          if (ZHS.panel) ZHS.panel.alert('自动学习：正在进入未学完的课程…', 'info', 4000);
+          await runOnHub('auto-learn');
+          return;
+        }
+
+        if (!fromAutoHop) {
+          // 用户只是打开了课程中心 —— 只提示，不点课
+          ZHS.Log.info('[课程中心] 已进入课程中心页。如需自动选择未学完课程，请在面板点击「找下一门课」'
+            + '（或由「自动跳课」在学完一门课后自动触发）');
+          return;
+        }
+
+        ZHS.Log.info('[课程中心] 检测到自动跳课意图（上一门课已学完），开始选择下一门课');
+        await runOnHub('auto-hop');
+      } catch (e) {
+        ZHS.Log.warn('[课程中心] 页面就绪处理出错：' + e.message);
+      }
+    },
+
+    /** 用户手动触发：在面板点「找下一门课」时调用 */
+    async triggerManual() {
+      if (!ZHS.config.autoCoursePick) {
+        ZHS.Log.warn('[课程中心] 自动选课开关已关闭，请先开启');
+        if (ZHS.panel) ZHS.panel.alert('请先在设置里开启「课程中心自动选课」', 'warn');
+        return false;
+      }
+      if (!isHubPage()) {
+        ZHS.Log.warn('[课程中心] 当前不在课程中心页，无法选课');
+        if (ZHS.panel) ZHS.panel.alert('请先进入课程中心页面', 'warn');
+        return false;
+      }
+      return await runOnHub('manual');
+    },
+  };
+
+  ZHS.CourseHub = CourseHub;
+
+  // 自启动改为「安全入口」：只做认领与提示，不会在用户没授权时点课。
+  // 参见 onPageReady() 的设计铁律说明。
+  try {
+    setTimeout(() => { ZHS.CourseHub.onPageReady(); }, 1500);
+  } catch (e) { /* 忽略 */ }
+  ZHS.Log.debug('[课程中心] 调度模块已加载');
+})();
+
+/* ===== 06c-exam.js ===== */
+/**
+ * 智慧树「在线作业 / 在线考试」作答页 —— 守株待兔式自动答题
+ *
+ * ============ 设计原则（源自用户原话，务必理解后再改）============
+ *
+ * 用户要的是「我不主动去找作业，但当我点进去时你帮我答完」：
+ *
+ *   用户自己点进作业/考试作答页
+ *        ↓
+ *   脚本发现「在作答页」且在允许的章节范围内
+ *        ↓
+ *   自动逐题拿答案 → 填进页面 → （可选）点提交
+ *        ↓
+ *   停下。不跳下一个任务、不回列表页、不循环。
+ *
+ * ============ 绝对禁止的行为（见下方 FORBIDDEN，改动时勿越界）============
+ *   ❌ 不调用 location.href / location.replace 跳转到任何作业/考试页
+ *   ❌ 不在列表页自动点击「开始答题 / 进入作业」
+ *   ❌ 不做「答完一个自动找下一个」的循环
+ *   ❌ 不自动点进任何 dohomework / doexamination 链接
+ *
+ * 原因：自动跳转会被平台识别为异常行为，且用户明确说「配置剔除自动进入」。
+ *       「主动出击」是用户明确否掉的方案，不要自作聪明加回来。
+ *
+ * ============ 页面事实============
+ *   作答页 URL： #/webExamList/dohomework/{...} 或 #/webExamList/doexamination/{...}
+ *   列表页 URL： #/webExamList（不含上面两者）
+ *   题目块：     .examPaper_subject[data-questionid]
+ *   题型标签：   .subject_type_describe .subject_type    文案形如「【单选题】(2分)」
+ *   题干：       .subject_describe                        （innerHTML 注入）
+ *   选项：       .subject_node > .nodeLab
+ *   选项勾选框： .nodeLab input                            （radio/checkbox + v-model）
+ *   选项文本：   .nodeLab .node_detail.examquestions-answer（innerHTML 注入）
+ *   提交按钮：   button.submit-btn  （可点 .active-color / 禁用 .disable-color）
+ *
+ * ⚠️ 全套选择器来自「官方 SPA 打包产物反编译」，非登录态运行时实测。
+ *    运行时可能多出 data-v-xxxx 作用域属性（不影响 class 选择器）。
+ *    因此每一处 DOM 操作都做了空值容错，任何一步失败只 warn 不抛异常。
+ */
+(function () {
+  'use strict';
+  const ZHS = window.ZHS;
+  if (!ZHS || !ZHS.Util) return;
+  // 重入守卫：SPA 二次注入时整个模块直接退出，避免定时器/监听器叠加
+  if (ZHS.__mod06c_exam) return;
+  ZHS.__mod06c_exam = true;
+  const U = ZHS.Util;
+
+  // ============ 禁止事项清单（写进代码，防止后来者误加功能）============
+  const FORBIDDEN = [
+    '不跳转：本模块永不调用 location.href / location.replace / window.open',
+    '不点击列表页：本模块永不点击 .jobExamComBtn / .course_ewstate / 任何 dohomework 链接',
+    '不循环：答完当前页即停止，不寻找下一个作业/考试',
+  ];
+
+  const PREFIX = '[作业考试]';
+
+  // ============ 页面判定 ============
+
+  /** 当前是否在作业/考试「作答页」（dohomework / doexamination） */
+  function isAnswerPage() {
+    try {
+      const h = String(location.hash || '');
+      return /dohomework|doexamination/.test(h);
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /** 当前是否在作业/考试「列表页」（webExamList 且不含作答页关键字） */
+  function isListPage() {
+    try {
+      const h = String(location.hash || '');
+      if (!/webExamList/.test(h)) return false;
+      return !/dohomework|doexamination/.test(h);
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /** 当前是作业还是考试（用于日志语义；两者 DOM 结构一致） */
+  function examKind() {
+    try {
+      const h = String(location.hash || '');
+      if (/doexamination/.test(h)) return '考试';
+      if (/dohomework/.test(h)) return '作业';
+    } catch (e) { /* 忽略 */ }
+    return '作业/考试';
+  }
+
+  // ============ 章节范围过滤 ============
+  //
+  // 现状（如实说明）：作答页 URL 只有 recruitId/stuExamId/examId/courseId/schoolId，
+  // 不含章节号；页面 DOM 也没有章节锚点。所以「按章节作答」目前只能在
+  // 「能从 URL 或页面文字解析出章节号」时生效。
+  //
+  // 解析优先级：
+  //   1. URL 查询参数 chapterNum / chapter / chapterId（部分入口会带）
+  //   2. hash 段末（少数入口把章节拼在 hash 里）
+  //   3. 页面标题/面包屑里的「第 N 章」
+  // 全部拿不到 → 返回 null，调用方退化为「全部作答」并明确告知用户。
+
+  const CHAPTER_SELECTORS = [
+    '.examPaper_tit',
+    '.examPaper_title',
+    '.examPaper-head',
+    '.subject_stem_title',
+    '.crumbs',
+    '.breadcrumb',
+  ];
+
+  /** 中文数字 → 阿拉伯数字（只处理 1~99 的常见写法，够章节用） */
+  function cnNum(s) {
+    const D = { 零: 0, 一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 };
+    if (!s) return null;
+    if (s === '十') return 10;
+    let n = 0;
+    if (s.includes('十')) {
+      const [a, b] = s.split('十');
+      n = (a ? D[a] || 0 : 1) * 10 + (b ? D[b] || 0 : 0);
+    } else {
+      n = D[s];
+      if (n === undefined) return null;
+    }
+    return n;
+  }
+
+  /** 从文本里抽「第 N 章」「第N章」（阿拉伯数字与中文数字都认）里的 N */
+  function parseChapterFromText(text) {
+    const t = String(text || '');
+    // 先认阿拉伯数字
+    let m = t.match(/第\s*(\d+)\s*[章节单元]/);
+    if (m) {
+      const n = Number(m[1]);
+      if (Number.isFinite(n) && n > 0) return n;
+    }
+    // 再认中文数字（真实站点标题常写「第三章」）
+    m = t.match(/第\s*([一二三四五六七八九十零]{1,3})\s*[章节单元]/);
+    if (m) {
+      const n = cnNum(m[1]);
+      if (Number.isFinite(n) && n > 0) return n;
+    }
+    return null;
+  }
+
+  /** 解析当前作业/考试所属章节号；拿不到返回 null */
+  function detectChapter() {
+    // 1. URL 查询参数
+    for (const key of ['chapterNum', 'chapter', 'chapterId', 'chapterNo']) {
+      const v = U.getUrlParam(key);
+      const n = Number(v);
+      if (Number.isFinite(n) && n > 0) return n;
+    }
+
+    // 2. hash 段末（形如 .../dohomework/{recruitId}/.../{schoolId}/{meetCourseType}）
+    //    参数位不是章节，这里只在明确出现 chapter 字样时尝试
+    try {
+      const h = decodeURIComponent(String(location.hash || ''));
+      const m = h.match(/chapter[^/]*?(\d+)/i);
+      if (m) {
+        const n = Number(m[1]);
+        if (Number.isFinite(n) && n > 0) return n;
+      }
+      const t = parseChapterFromText(h);
+      if (t) return t;
+    } catch (e) { /* 忽略 */ }
+
+    // 3. 页面可见文字（标题 / 面包屑）
+    for (const sel of CHAPTER_SELECTORS) {
+      let el = null;
+      try { el = document.querySelector(sel); } catch (e) { el = null; }
+      if (!el) continue;
+      const n = parseChapterFromText(U.normText(el.innerText || el.textContent || ''));
+      if (n) return n;
+    }
+
+    return null;
+  }
+
+  /**
+   * 章节范围判断
+   * @param {number|null} chapterNum 当前章节号；null = 未能识别
+   * @param {number} from 起始章节（0 = 不限）
+   * @param {number} to   结束章节（0 = 不限）
+   * @returns {boolean}
+   */
+  function inChapterRange(chapterNum, from, to) {
+    const lo = Number(from) || 0;
+    const hi = Number(to) || 0;
+    // 两端都是 0 → 不限
+    if (lo === 0 && hi === 0) return true;
+    // 未能识别章节 → 不拦（宁可多答，不可漏答；调用方会打日志告知）
+    if (chapterNum == null) return true;
+    if (lo > 0 && chapterNum < lo) return false;
+    if (hi > 0 && chapterNum > hi) return false;
+    return true;
+  }
+
+  // ============ 题目解析 ============
+
+  const QTYPE = {
+    SINGLE: 'single',
+    MULTIPLE: 'multiple',
+    JUDGEMENT: 'judgement',
+    COMPLETION: 'completion',
+    QA: 'qa',
+    UNKNOWN: 'unknown',
+  };
+
+  /** 题型文案 → 内部题型（对照 review-worker-20 的【单选题】(2分) 格式） */
+  function parseType(text) {
+    const t = String(text || '');
+    if (t.includes('多选')) return QTYPE.MULTIPLE;
+    if (t.includes('单选')) return QTYPE.SINGLE;
+    if (t.includes('判断')) return QTYPE.JUDGEMENT;
+    if (t.includes('填空')) return QTYPE.COMPLETION;
+    if (t.includes('简答') || t.includes('问答') || t.includes('论述')) return QTYPE.QA;
+    return QTYPE.UNKNOWN;
+  }
+
+  /** 元素 HTML 里可能带 img，把 data-src 提到 src（复用 08-questions 的做法） */
+  function hydrateImages(root) {
+    if (!root) return;
+    try {
+      if (ZHS.Questions && ZHS.Questions.hydrateImages) {
+        ZHS.Questions.hydrateImages(root);
+        return;
+      }
+      root.querySelectorAll('img').forEach((img) => {
+        if (img.dataset && img.dataset.src && img.src !== img.dataset.src) img.src = img.dataset.src;
+      });
+    } catch (e) { /* 忽略 */ }
+  }
+
+  /**
+   * 采集页面上的全部题目
+   * @returns {Array<{id, type, stem, options, optionEls, node, index}>}
+   */
+  function collectQuestions() {
+    const out = [];
+    let nodes = [];
+    try {
+      nodes = Array.from(document.querySelectorAll('.examPaper_subject'));
+    } catch (e) {
+      ZHS.Log.warn(PREFIX + ' 题目选择器查询失败：' + e.message);
+      return out;
+    }
+
+    nodes.forEach((node, index) => {
+      try {
+        hydrateImages(node);
+
+        // 题干（.subject_describe 是 innerHTML 注入，取 textContent）
+        const stemEl = node.querySelector('.subject_describe');
+        const stem = U.normText(stemEl ? (stemEl.textContent || '') : '') ||
+          U.normText(node.textContent || '').slice(0, 300);
+
+        // 题型：优先看 .subject_type 的「【单选题】(2分)」
+        let typeText = '';
+        const typeEl = node.querySelector('.subject_type_describe .subject_type') ||
+          node.querySelector('.subject_type');
+        if (typeEl) typeText = U.normText(typeEl.textContent || '');
+        const type = parseType(typeText);
+
+        // 选项
+        const optionEls = Array.from(node.querySelectorAll('.subject_node > .nodeLab'));
+        const options = optionEls.map((lab) => {
+          const txt = lab.querySelector('.node_detail.examquestions-answer') ||
+            lab.querySelector('.node_detail');
+          return U.normText(txt ? (txt.textContent || '') : (lab.textContent || ''));
+        });
+
+        out.push({
+          id: (node.dataset && node.dataset.questionid) || ('idx' + index),
+          qno: U.normText((node.querySelector('.subject_num') || {}).textContent || '') || String(index + 1),
+          type,
+          typeText,
+          stem,
+          options,
+          optionEls,
+          node,
+          index,
+        });
+      } catch (e) {
+        ZHS.Log.warn(PREFIX + ' 第 ' + (index + 1) + ' 题解析失败：' + e.message);
+      }
+    });
+
+    return out;
+  }
+
+  // ============ 答案获取（复用现有双通道：题库 → LLM）============
+
+  /**
+   * 取答案
+   * 复用 ZHS.Solver.solve({title, options, type})，它内部已实现
+   * 「题库优先（ZHS.Bank.search）→ LLM 兜底（ZHS.LLM.vote）→ 按 gatedRandom 决定是否蒙」。
+   * @returns {Promise<{answer, from}|null>}
+   */
+  async function askAnswer(q) {
+    if (!ZHS.Solver || typeof ZHS.Solver.solve !== 'function') {
+      ZHS.Log.warn(PREFIX + ' 解题器（ZHS.Solver）不可用，无法取答案');
+      return null;
+    }
+    try {
+      const r = await ZHS.Solver.solve({
+        title: q.stem,
+        options: q.options,
+        type: q.type,
+      });
+      return r || null;
+    } catch (e) {
+      ZHS.Log.warn(PREFIX + ' 第 ' + q.qno + ' 题求解异常：' + (e && e.message));
+      return null;
+    }
+  }
+
+  // ============ 答案回填 ============
+
+  /** 判断选项是否已选中（复用 ZHS.Filler.isChecked，兜底自己实现） */
+  function optionChecked(el) {
+    try {
+      if (ZHS.Filler && typeof ZHS.Filler.isChecked === 'function') return ZHS.Filler.isChecked(el);
+    } catch (e) { /* 落到兜底 */ }
+    const input = el && el.querySelector && el.querySelector('input');
+    return !!(input && input.checked);
+  }
+
+  /**
+   * 勾选一个选项
+   *
+   * 关键点：智慧树用 Vue 的 v-model="checkboxVal" 绑在 .nodeLab input 上。
+   * 直接改 input.checked 不会触发 Vue 更新，必须补发 change / input 事件；
+   * 优先直接 click()（最贴近真人操作，Vue 自己能收到）。
+   */
+  async function checkOption(el) {
+    if (!el) return false;
+    if (optionChecked(el)) {
+      ZHS.Log.debug(PREFIX + ' 选项已选中，跳过（防取消）');
+      return true;
+    }
+
+    const input = el.querySelector('input');
+
+    // 1. 优先点 input：Vue 的 v-model 在 input 上，click 会自动同步数据
+    if (input) {
+      try { input.click(); } catch (e) {
+        try {
+          input.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+        } catch (e2) { /* 忽略 */ }
+      }
+      await U.sleep(220);
+      if (input.checked) return true;
+    }
+
+    // 2. 点整块 .nodeLab（外层 label 有点击代理）
+    try { el.click(); } catch (e) { /* 忽略 */ }
+    await U.sleep(220);
+    if (optionChecked(el)) return true;
+
+    // 3. 兜底：直接改 checked + 补发事件（让 v-model 收到）
+    if (input) {
+      try {
+        input.checked = true;
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+        await U.sleep(120);
+        if (input.checked) return true;
+      } catch (e) { /* 忽略 */ }
+    }
+
+    ZHS.Log.warn(PREFIX + ' 选项点击后仍未选中');
+    return false;
+  }
+
+  /** 把答案文本与选项文本做模糊匹配，返回选项索引；匹配不上返回 -1 */
+  function matchOptionByText(answer, options) {
+    const a = U.normText(answer);
+    if (!a || !options || !options.length) return -1;
+
+    const norm = (s) => U.normText(s)
+      .replace(/^[A-Da-d][.、．)）:：]?\s*/, '')   // 去掉「A. 」这类前缀再比
+      .replace(/[\s,，。.、;；:：]/g, '');
+
+    const na = norm(a);
+
+    // 完全相等
+    for (let i = 0; i < options.length; i++) {
+      if (norm(options[i]) === na) return i;
+    }
+    // 互相包含
+    for (let i = 0; i < options.length; i++) {
+      const no = norm(options[i]);
+      if (!no) continue;
+      if (no.includes(na) || na.includes(no)) return i;
+    }
+    return -1;
+  }
+
+  /**
+   * 解析答案 → 选项索引数组
+   * 两种策略都试：① A/B/C/D 字母 → 索引  ② 答案文本包含匹配
+   */
+  function resolveIndexes(answer, options) {
+    // ① 字母
+    let idxs = [];
+    try {
+      if (ZHS.Bank && typeof ZHS.Bank.toIndexes === 'function') idxs = ZHS.Bank.toIndexes(answer) || [];
+    } catch (e) { idxs = []; }
+
+    if (idxs.length) {
+      const valid = idxs.filter((i) => i >= 0 && i < options.length);
+      if (valid.length) return valid;
+    }
+
+    // ② 文本包含匹配（答案可能是「正确」「北京」这类）
+    const i = matchOptionByText(answer, options);
+    if (i >= 0) return [i];
+
+    return [];
+  }
+
+  /**
+   * 回填一道选择题 / 判断题
+   * @returns {Promise<boolean>} 是否真的选上了
+   */
+  async function fillChoice(q, answer) {
+    const idxs = resolveIndexes(answer, q.options);
+    if (!idxs.length) {
+      ZHS.Log.warn(PREFIX + ' 第 ' + q.qno + ' 题答案「' + String(answer).slice(0, 30) +
+        '」无法对应到选项（共 ' + q.options.length + ' 个），跳过');
+      return false;
+    }
+
+    let done = 0;
+    for (const i of idxs) {
+      const el = q.optionEls[i];
+      if (!el) continue;
+      // eslint-disable-next-line no-await-in-loop
+      const okOne = await checkOption(el);
+      if (okOne) done++;
+    }
+    if (done > 0) return true;
+
+    ZHS.Log.warn(PREFIX + ' 第 ' + q.qno + ' 题选项全部点击失败');
+    return false;
+  }
+
+  /**
+   * 回填判断题
+   * 判断题 DOM 同样是 .nodeLab 选项（通常两个：对 / 错），
+   * 先按「对/错」文本匹配，匹配不到再用索引兜底（0=对，1=错）。
+   */
+  async function fillJudgement(q, answer) {
+    const ans = String(answer || '').trim();
+    const isTrue = /^(对|正确|是|√|✓|true|t)$/i.test(ans);
+    const isFalse = /^(错|错误|否|×|✗|false|f)$/i.test(ans);
+
+    if (!isTrue && !isFalse) {
+      // 不是标准判定词，退回通用匹配
+      return fillChoice(q, answer);
+    }
+
+    // 1. 文本匹配
+    for (let i = 0; i < q.optionEls.length; i++) {
+      const t = U.normText(q.options[i]);
+      if (isTrue && /^(对|正确|是|√|✓|true|t)/i.test(t)) {
+        return checkOption(q.optionEls[i]);
+      }
+      if (isFalse && /^(错|错误|否|×|✗|false|f)/i.test(t)) {
+        return checkOption(q.optionEls[i]);
+      }
+    }
+    // 2. 索引兜底
+    const idx = isTrue ? 0 : 1;
+    if (q.optionEls[idx]) return checkOption(q.optionEls[idx]);
+
+    ZHS.Log.warn(PREFIX + ' 第 ' + q.qno + ' 题判断题未能定位选项');
+    return false;
+  }
+
+  /**
+   * round-44：回填主观题（填空/问答）
+   * 复用 ZHS.Filler.fill 的 completion/qa 分支（fillText：找 textarea/input 填文本 + 补 input/change 事件）。
+   * 只传 {type, node}——Filler 的 completion/qa 分支仅用容器定位输入框。
+   * Filler 不可用时降级到模块内 localFillText 兜底（任何一步失败只 warn 不抛异常）。
+   */
+  async function fillSubjective(q, answer) {
+    const text = String(answer == null ? '' : answer).trim();
+    if (!text) {
+      ZHS.Log.warn(PREFIX + ' 第 ' + q.qno + ' 题主观题答案为空，跳过');
+      return false;
+    }
+    if (ZHS.Filler && typeof ZHS.Filler.fill === 'function') {
+      try {
+        const r = await ZHS.Filler.fill({ type: q.type, node: q.node }, { answer: text });
+        return !!(r && r.ok);
+      } catch (e) {
+        ZHS.Log.warn(PREFIX + ' 第 ' + q.qno + ' 题 Filler 回填异常：' + e.message);
+      }
+    }
+    // 兜底：模块内直接找输入框填
+    return localFillText(q.node, text);
+  }
+
+  /** 模块内填空兜底（Filler 缺失时）：找容器内第一个可输入控件填文本 */
+  function localFillText(root, text) {
+    try {
+      const scope = root || document;
+      const input = scope.querySelector('textarea, input[type="text"]');
+      if (!input) {
+        ZHS.Log.warn(PREFIX + ' 未找到可填写的输入框');
+        return false;
+      }
+      input.focus();
+      input.value = text;
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+      input.blur();
+      return input.value === text;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // ============ 提交 ============
+
+  /** 找到可点的提交按钮（必须先确认不是 disable-color） */
+  function findSubmitButton() {
+    let btn = null;
+    try { btn = document.querySelector('button.submit-btn'); } catch (e) { btn = null; }
+    if (!btn) return null;
+
+    const cls = btn.className || '';
+    if (/disable-color/.test(cls)) {
+      ZHS.Log.warn(PREFIX + ' 提交按钮处于禁用态（.disable-color），不点击');
+      return null;
+    }
+    if (!/active-color/.test(cls)) {
+      // 类名可能随版本变化；没有明确禁用才允许点
+      ZHS.Log.warn(PREFIX + ' 提交按钮未带 .active-color，类名为「' + cls + '」，仍尝试点击（请留意结果）');
+    }
+    return btn;
+  }
+
+  /** 等待若干秒（给用户反悔机会），面板可看到倒计时日志 */
+  async function waitBeforeSubmit(seconds) {
+    const total = Math.max(0, Number(seconds) || 0);
+    if (total <= 0) return;
+    ZHS.Log.info(PREFIX + ' ' + total + ' 秒后自动提交（想反悔请尽快点「停止」或手动操作页面）');
+    for (let i = total; i > 0; i--) {
+      // eslint-disable-next-line no-await-in-loop
+      await U.sleep(1000);
+      if (i <= 3 || i % 5 === 0) ZHS.Log.debug(PREFIX + ' 距提交还有 ' + i + ' 秒');
+    }
+  }
+
+  // ============ 主流程 ============
+
+  const Exam = {
+    isAnswerPage,
+    isListPage,
+    examKind,
+    detectChapter,
+    inChapterRange,
+    collectQuestions,
+    parseType,
+    resolveIndexes,
+    _running: false,
+    _done: false,        // 本页是否已处理过（防 SPA 重复触发）
+    _sig: '',            // 本页处理签名（URL + 题目数），变了才重新处理
+
+    /**
+     * 作答当前页
+     * @param opts.manual 面板「答题」按钮手动触发：跳过 autoExam 开关
+     */
+    async solvePage(opts) {
+      const manual = !!(opts && opts.manual);
+      const cfg = ZHS.config;
+
+      // —— 门禁 1：必须在作答页 ——
+      if (!isAnswerPage()) {
+        if (manual) ZHS.Log.warn(PREFIX + ' 当前不在作业/考试作答页，无需作答');
+        return;
+      }
+
+      // —— 门禁 2：总开关（手动触发绕过）——
+      // 【严格判断】必须用 !== true，不能用 !cfg.autoExam。
+      // 这是个「默认关闭」的安全开关：一旦存储被写入脏值（如字符串 "no"、"false"、"0"），
+      // `!"no"` 为 false，会把自动答题【偷偷打开】—— 在考试场景下这是不可接受的。
+      // 只有明确等于 true 才放行。
+      if (!manual && cfg.autoExam !== true) return;
+
+      if (this._running) {
+        ZHS.Log.debug(PREFIX + ' 作答流程进行中，跳过重复触发');
+        return;
+      }
+
+      const kind = examKind();
+
+      // —— 章节识别 ——
+      const chapter = detectChapter();
+      // 【数值夹逼】范围必须是非负整数。直接改存储/调 API 写入 -5 或 999 时，
+      // 负数会被当成「不限」，造成意外的越权范围。统一夹到 0~999 的整数。
+      const clampCh = (v) => {
+        const n = Math.floor(Number(v));
+        if (!Number.isFinite(n) || n < 0) return 0;
+        return Math.min(n, 999);
+      };
+      const from = clampCh(cfg.examChapterFrom);
+      const to = clampCh(cfg.examChapterTo);
+      const ranged = from > 0 || to > 0;
+
+      if (ranged) {
+        if (chapter == null) {
+          ZHS.Log.warn(PREFIX + ' 未能识别当前' + kind + '所属章节（URL 与页面均无章节信息），按全部作答。' +
+            '如需精确按章节，请把章节范围改回 0');
+        } else if (!inChapterRange(chapter, from, to)) {
+          ZHS.Log.info(PREFIX + ' 当前' + kind + '属于第 ' + chapter + ' 章，不在设定范围（' +
+            (from || '不限') + '~' + (to || '不限') + '）内，本次不作答');
+          return;
+        } else {
+          ZHS.Log.info(PREFIX + ' 当前' + kind + '属于第 ' + chapter + ' 章，在设定范围内，开始作答');
+        }
+      }
+
+      this._running = true;
+      const t0 = Date.now();
+      try {
+        ZHS.Log.info(PREFIX + ' 检测到' + kind + '作答页，开始自动作答（守株待兔模式：答完即停，不会跳转其它任务）');
+
+        // 等题目渲染出来（Vue 是异步渲染的）
+        let questions = collectQuestions();
+        for (let i = 0; i < 20 && !questions.length; i++) {
+          // eslint-disable-next-line no-await-in-loop
+          await U.sleep(500);
+          questions = collectQuestions();
+        }
+
+        if (!questions.length) {
+          ZHS.Log.warn(PREFIX + ' 未找到题目（.examPaper_subject 为空），可能页面结构变化或尚未加载完成');
+          return;
+        }
+
+        ZHS.Log.info(PREFIX + ' 共 ' + questions.length + ' 题');
+
+        const skippedTypes = [];
+        const failed = [];       // 未答上的题号
+        let answered = 0;
+        let subjective = 0;
+        let subjectiveDone = 0;  // round-44：主观题自动作答成功数
+
+        for (const q of questions) {
+          const isSubjective = q.type === QTYPE.COMPLETION || q.type === QTYPE.QA;
+          // round-44：主观题（填空/问答）默认改为「LLM 生成答案回填」（Filler.fill 已支持
+          // completion/qa），补齐「作业/单元测试自动答题对主观题完全无解」的盲区。
+          // 仅在用户显式关闭 examSubjective 时才跳过；无答案（无 LLM Key/题库未命中）时
+          // 走下方「未取得答案」分支提示手动作答，绝不瞎填污染成绩。
+          if (isSubjective && cfg.examSubjective === false) {
+            subjective++;
+            skippedTypes.push(q.qno + '(' + q.typeText + ')');
+            ZHS.Log.warn(PREFIX + ' 第 ' + q.qno + ' 题是主观题（' + (q.typeText || '填空/问答') +
+              '），已在配置关闭自动作答，请手动完成');
+            continue;
+          }
+
+          if (!q.stem && !q.options.length) {
+            ZHS.Log.warn(PREFIX + ' 第 ' + q.qno + ' 题既无题干也无选项，跳过');
+            failed.push(q.qno);
+            continue;
+          }
+
+          // eslint-disable-next-line no-await-in-loop
+          const result = await askAnswer(q);
+          if (!result || !result.answer) {
+            ZHS.Log.warn(PREFIX + ' 第 ' + q.qno + ' 题未取得答案，跳过' +
+              (isSubjective ? '（主观题需 LLM Key，未配置或题库未命中）' : '（未配置 LLM Key 或题库未命中）'));
+            failed.push(q.qno);
+            continue;
+          }
+
+          // eslint-disable-next-line no-await-in-loop
+          let okOne = false;
+          if (q.type === QTYPE.JUDGEMENT) {
+            // eslint-disable-next-line no-await-in-loop
+            okOne = await fillJudgement(q, result.answer);
+          } else if (isSubjective) {
+            // eslint-disable-next-line no-await-in-loop
+            okOne = await fillSubjective(q, result.answer);
+          } else {
+            // eslint-disable-next-line no-await-in-loop
+            okOne = await fillChoice(q, result.answer);
+          }
+
+          if (okOne) {
+            answered++;
+            if (isSubjective) subjectiveDone++;
+            ZHS.state.answeredCount++;
+            ZHS.Log.info(PREFIX + ' 第 ' + q.qno + ' 题已作答：' + String(result.answer).slice(0, 40) +
+              '（来源 ' + (result.from || '未知') + '）' + (isSubjective ? '【主观题·LLM生成·请提交前检查】' : ''));
+          } else {
+            failed.push(q.qno);
+            ZHS.Log.warn(PREFIX + ' 第 ' + q.qno + ' 题回填失败：答案 ' + String(result.answer).slice(0, 40));
+          }
+
+          // 每题之间的间隔（复用现有 answerDelay 配置）
+          const d = Number(cfg.answerDelay) || 0;
+          // eslint-disable-next-line no-await-in-loop
+          if (d > 0) await U.sleep(d * 1000);
+        }
+
+        // —— 结果小结 ——
+        const cost = ((Date.now() - t0) / 1000).toFixed(1);
+        ZHS.Log.info(PREFIX + ' 作答完成：成功 ' + answered + ' / ' + questions.length +
+          ' 题，耗时 ' + cost + ' 秒');
+
+        if (subjective > 0) {
+          ZHS.Log.warn(PREFIX + ' 有 ' + subjective + ' 道主观题未处理（题号：' +
+            skippedTypes.join('、') + '），请手动作答');
+        }
+        if (failed.length) {
+          ZHS.Log.warn(PREFIX + ' 以下题号未答上：' + failed.join('、') + '（建议手动补答）');
+        }
+
+        // —— 提交 ——
+        // 注意：这里【只提交当前这一页】，绝不跳转、绝不寻找下一个任务。
+        if (!cfg.examSubmit) {
+          ZHS.Log.info(PREFIX + ' 「答完自动提交」已关闭，答案已填入页面，请自行检查后手动提交');
+          if (ZHS.panel) ZHS.panel.alert(kind + '已作答 ' + answered + ' 题，请手动检查后提交', 'info', 8000);
+          return;
+        }
+
+        if (answered === 0) {
+          ZHS.Log.warn(PREFIX + ' 一题都没答上，不自动提交（避免交白卷）');
+          if (ZHS.panel) ZHS.panel.alert('该' + kind + '一题都没答上，已跳过自动提交，请手动处理', 'warn', 10000);
+          return;
+        }
+
+        await waitBeforeSubmit(cfg.examSubmitDelay);
+
+        const btn = findSubmitButton();
+        if (!btn) {
+          ZHS.Log.warn(PREFIX + ' 未找到可点击的提交按钮，请手动点「提交」');
+          if (ZHS.panel) ZHS.panel.alert('未找到提交按钮，请手动提交', 'warn', 8000);
+          return;
+        }
+
+        try {
+          btn.click();
+          ZHS.Log.info(PREFIX + ' 已点击「提交」按钮');
+        } catch (e) {
+          try {
+            btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+            ZHS.Log.info(PREFIX + ' 已派发提交点击事件');
+          } catch (e2) {
+            ZHS.Log.warn(PREFIX + ' 提交点击失败：' + e2.message);
+            return;
+          }
+        }
+
+        await U.sleep(1200);
+        ZHS.Log.info(PREFIX + ' 流程结束。本模块到此为止：不跳转、不寻找下一个作业/考试');
+        if (ZHS.panel) {
+          ZHS.panel.alert(kind + '自动作答并提交完成（' + answered + ' 题）。' +
+            (failed.length ? '有 ' + failed.length + ' 题未答上，请检查。' : ''), 'info', 10000);
+        }
+
+        // 标记本页处理完，防止 SPA 反复触发
+        this._done = true;
+        this._sig = location.hash + '|' + questions.length;
+      } catch (e) {
+        // 任何异常都不外溢，只记录，保证不打断页面其它功能
+        ZHS.Log.error(PREFIX + ' 作答流程异常：' + (e && e.message));
+      } finally {
+        this._running = false;
+      }
+    },
+
+    /** 重置「本页已处理」标记（切页后调用） */
+    reset() {
+      this._done = false;
+      this._sig = '';
+    },
+
+    /** 对外暴露禁止事项，方便测试断言 */
+    FORBIDDEN,
+  };
+
+  ZHS.Exam = Exam;
+
+  // ============ 自启动（严格安全）============
+  //
+  // 安全要求（前车之鉴：06b-course-hub 会主动跳转，本模块【禁止】任何跳转动作）：
+  //   · 只在「作答页」做检测
+  //   · 只有 autoExam === true 才真正作答
+  //   · 在「列表页」仅打一条 debug 日志，绝不点击任何东西
+  //   · 开关关闭时行为与改动前【完全一致】
+
+  function tick() {
+    try {
+      if (isAnswerPage()) {
+        const cfg = ZHS.config;
+
+        // 严格判断：只有明确 true 才作答。脏值（"no"/"false"/0）一律视为关闭，
+        // 不能让「默认关闭」的安全开关被非布尔值绕过（见 solvePage 门禁 2 的说明）。
+        if (cfg.autoExam !== true) {
+          // 关闭态：只提示一次，什么都不做
+          if (!Exam._notified) {
+            Exam._notified = true;
+            ZHS.Log.info(PREFIX + ' 检测到' + examKind() + '作答页。当前版本不处理作业/考试（不答题、不提交），请自行完成。');
+          }
+          return;
+        }
+
+        // 已处理过且 URL 没变 → 不重复（SPA 的 MutationObserver / 定时器会反复触发）
+        const sig = location.hash;
+        if (Exam._done && Exam._sig && Exam._sig.indexOf(sig) === 0) return;
+
+        // 防重入 + 定时器兜底：solvePage 内部也有 _running 保护
+        if (!Exam._running) Exam.solvePage();
+        return;
+      }
+
+      if (isListPage()) {
+        // 列表页：只记录，绝无自动点击（这是用户明确要求的「守株待兔」）
+        if (!Exam._listNotified) {
+          Exam._listNotified = true;
+          ZHS.Log.debug(PREFIX + ' 当前是作业/考试列表页。本模块不会自动进入任何作业或考试，' +
+            '请自行点进想作答的那一个');
+        }
+      }
+    } catch (e) {
+      ZHS.Log.debug(PREFIX + ' 检测异常：' + (e && e.message));
+    }
+  }
+
+  // 页面加载后先等平台渲染，再轮询检测。
+  // 用轮询而不用 MutationObserver：SPA 路由切换（hash 变化）不产生 DOM mutation 时
+  // MutationObserver 收不到，轮询更稳，且开销极低（3 秒一次，几乎全是字符串判断）。
+  function bootstrap() {
+    setTimeout(tick, 2000);
+    setInterval(tick, 3000);
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', bootstrap);
+  } else {
+    bootstrap();
+  }
+
+  ZHS.Log.debug(PREFIX + ' 模块已加载（守株待兔模式：只在作答页工作，永不自动跳转）');
+})();
+
+/* ===== 07-main.js ===== */
+/**
+ * 主入口：初始化 + SPA 监听
+ */
+(function () {
+  'use strict';
+  const ZHS = window.ZHS;
+  if (!ZHS || !ZHS.Util) return;
+  // 重入守卫：SPA 二次注入时整个模块直接退出，避免定时器/监听器叠加
+  if (ZHS.__mod07_main) return;
+  ZHS.__mod07_main = true;
+  const U = ZHS.Util;
+
+  let initialized = false;
+  let bootTries = 0;
+  const BOOT_MAX_TRIES = 3;
+
+  /**
+   * round-14：面板外兜底提示条。
+   *
+   * 背景：面板是脚本唯一的可见界面。一旦 ZHS.panel 缺失或 mount 失败，
+   * 原代码只写一行 ZHS.Log.error —— 而日志恰恰是写进「面板自己的日志缓冲」里的，
+   * 面板正是此刻看不见的那个东西，等于零提示；普通用户也不会开 F12。
+   * 结果就是「脚本在后台照常跑，用户一个界面元素都看不到」= 用户报的「装了跟没装一样」。
+   *
+   * 这里直接在页面根节点挂一条固定定位的红条，不依赖面板、不依赖 Shadow DOM，
+   * 只用最朴素的 DOM 操作，尽可能在任何环境下都能显示出来。
+   */
+  function showPanelMissingNotice(detail) {
+    try {
+      if (document.getElementById('zhs-panel-missing-notice')) return;   // 去重
+      const bar = document.createElement('div');
+      bar.id = 'zhs-panel-missing-notice';
+      bar.setAttribute('style',
+        'position:fixed;top:0;left:0;right:0;z-index:2147483647;'
+        + 'background:#e74c3c;color:#fff;font-size:13px;line-height:1.7;'
+        + 'padding:8px 14px;text-align:center;font-family:system-ui,-apple-system,"Microsoft YaHei",sans-serif;'
+        + 'box-shadow:0 2px 8px rgba(0,0,0,.25)');
+      bar.textContent = '智慧树助手：脚本正在后台运行，但控制面板初始化失败'
+        + (detail ? '（' + detail + '）' : '')
+        + '。请刷新页面重试；若仍不显示，可在控制台执行 zhs.boot()。';
+      // 点一下可关闭，不打扰用户
+      bar.addEventListener('click', () => { try { bar.remove(); } catch (e) { /* 忽略 */ } });
+      (document.body || document.documentElement).appendChild(bar);
+      ZHS.Log.warn('已显示面板外兜底提示条（面板不可用）');
+    } catch (e) { /* 连兜底条都挂不上，只能留在日志里 */ }
+  }
+
+  /**
+   * 启动外壳：负责「失败要能看得见，且允许重试」
+   *
+   * 【2026-09-19 修正】原来的 boot() 第一句就是 `initialized = true`。
+   * 这意味着只要中间任何一步抛异常（新版页面对抗、某个 DOM 访问越界、
+   * 平台改版导致选择器非法……），boot 会中断在半路，但 initialized 已经置真，
+   * 于是 watchSpa() 里那条「页面还没初始化但出现视频 → 补启动」的自愈通道永久失效。
+   * 后果正是用户反馈的那句：**装了 27 次，面板都没有，跟没装一样** ——
+   * 脚本其实跑了，只是跑一半死在没人看得见的地方。
+   *
+   * 现在改成三件事：
+   *   1. 成功跑完才算初始化完成（initialized 移到末尾）
+   *   2. 失败要看得见：先把面板挂上再报错，用户至少知道脚本在
+   *   3. 允许重试（最多 3 次），失败后交给 watchSpa 在 DOM 稳定时再来
+   */
+  async function boot() {
+    if (initialized || bootTries >= BOOT_MAX_TRIES) return;
+    bootTries++;
+    try {
+      await bootOnce();
+      initialized = true;
+    } catch (e) {
+      const msg = (e && e.message) || String(e);
+      initialized = false;   // 认账只在成功时做，这里保持「未初始化」才能被自愈通道救回
+      // 区分「还没进播放页（等自愈）」与「真出错」：前者用 info 不刷红，避免误导用户以为坏了
+      if (msg === 'NO_VIDEO_YET') {
+        ZHS.Log.info('尚未进入播放页（无视频元素），进入课程后自动启动');
+      } else {
+        ZHS.Log.error('初始化失败（第 ' + bootTries + '/' + BOOT_MAX_TRIES + ' 次）：' + msg);
+        try {
+          if (ZHS.panel) {
+            ZHS.panel.mount();
+            ZHS.panel.alert('脚本启动异常：' + msg + '。可刷新页面重试，或在控制台执行 zhs.boot()', 'error', 15000);
+          }
+        } catch (e2) { /* 连面板都挂不上，只能留在日志里 */ }
+        if (bootTries < BOOT_MAX_TRIES) ZHS.Log.info('将在页面 DOM 变化后自动重试启动');
+      }
+    }
+  }
+
+  async function bootOnce() {
+    ZHS.Log.info('=== 初始化开始 ===');
+
+    // 0. 面板最先挂载：后续任何一步炸了，用户至少能看见脚本存在
+    //    （原来排在第 3 步，且整条链无 try/catch → 前一步出错就永远看不到面板）
+    // round-15【B】：判据不能只看 `ZHS.panel` 是否为真 —— round-14 改成「先发布空对象占位」
+    // 后，即使面板模块体后半段抛异常，ZHS.panel 也是个 truthy 的空对象 {}，
+    // 于是这里会进 true 分支去调不存在的 mount()，抛 TypeError，
+    // 结果把「面板模块本身加载失败」的真实原因掩盖成「mount is not a function」，排查被带偏。
+    // 正确判据：既要有对象，也要 mount 真的是函数（即 __panel_ready 已置位）。
+    const panelUsable = !!(ZHS.panel && typeof ZHS.panel.mount === 'function');
+    if (panelUsable) {
+      try { ZHS.panel.mount(); }
+      catch (e) {
+        ZHS.Log.warn('面板挂载失败：' + e.message);
+        showPanelMissingNotice('挂载异常：' + (e && e.message ? e.message : '未知'));
+      }
+    } else {
+      // 挂不上必须说出来。静默跳过的话，用户眼里就是「装了跟没装一样」。
+      ZHS.Log.error('面板模块不可用（ZHS.panel 未就绪或 mount 缺失，__panel_ready='
+        + String(ZHS.__panel_ready) + '），界面不会显示；核心逻辑仍会继续尝试');
+      showPanelMissingNotice(ZHS.panel ? '模块加载中断（未完成初始化）' : '模块未加载');
+    }
+
+    // 1. 识别页面版本
+    ZHS.Catalog.redetect();
+
+    // 2. 课程标识
+    ZHS.state.courseId = ZHS.Catalog.getCourseId();
+    ZHS.Log.info('课程 ID：' + ZHS.state.courseId);
+
+    // 3. 面板先挂载：不等视频，进来就能看到界面。
+    //    以前写在 waitFor 之后，在作业页 / 尚未进入播放页时要干等 30 秒才出面板，
+    //    用户会误以为脚本没装上（BUG-UX-2）。
+    //    注意：此处必须 try/catch 包裹——若面板挂载持续失败（如模板改坏），
+    //    裸调用会把异常抛给 bootOnce → 被 boot 记成「初始化失败」→ Scheduler 永不启动，
+    //    整脚本（含核心逻辑）都不跑，正是「装了但功能全无用」的直接成因（round-7 面板①）。
+    if (ZHS.panel) {
+      try { ZHS.panel.mount(); } catch (e) { ZHS.Log.warn('面板二次挂载失败：' + e.message); }
+    }
+
+    // 4. 等视频出现（有些页面懒加载）
+    let video = await U.waitFor('video', 30000);
+    if (!video && ZHS.Util.findVideoInIframes) video = ZHS.Util.findVideoInIframes(document);
+    if (!video) {
+      ZHS.Log.warn('30 秒内未找到视频元素（含 iframe 兜底），可能不在播放页');
+      if (ZHS.panel) {
+        ZHS.panel.alert('未检测到视频，可能尚未进入播放页；面板可正常使用，进播放页后会自动开始', 'warn', 10000);
+      }
+      // 抛出而非 return：让 boot() 捕获后保持 initialized=false，
+      // 这样从「课程中心页 → 点进课程页出现 video」时，watchSpa 能重新拉起初始化。
+      // 若直接 return，bootOnce 判为「成功返回」，boot() 会把 initialized 误置 true，
+      // 自愈通道永久失效，表现正是用户说的「装了但进了课程页毫无动静」。
+      throw new Error('NO_VIDEO_YET');
+    }
+    ZHS.state.videoEl = video;
+    ZHS.Log.info('视频元素已就绪，时长 ' + Math.round(video.duration || 0) + 's');
+
+    // 5. 尝试断点恢复
+    await ZHS.Resume.restore(ZHS.state.courseId);
+
+    // 5.5 进入即跳首节未学（兜底：续播记录缺失/过期时，避免停在已看完的第 1 节）
+    //   根因：原先进入课程后只靠 resume 记录跳节；无记录就直接播页面默认加载的那节
+    //   （智慧树常把新课默认停在第 1 节），于是「永远看第一节课」。
+    //   守则需要同时满足，避免误跳：
+    //     ① skipFinished 开关开（语义本就是「自动跳过已完成节点」）；
+    //     ② 当前节确实已学完（isFinished）；
+    //     ③ 目录里还存在未学节（findNext 能捞到）。
+    //   全新课第 1 节本就没看完 → ② 不成立 → 不跳，保持平台默认位置。
+    if (ZHS.config.skipFinished) {
+      try {
+        const _cur = ZHS.Catalog.current();
+        if (_cur && ZHS.Catalog.isFinished(_cur)) {
+          const _firstUndone = ZHS.Catalog.findNext(null);
+          if (_firstUndone) {
+            ZHS.Log.info('进入课程：当前节已学完，自动跳到首节未学：'
+              + ZHS.Catalog.itemTitle(_firstUndone));
+            await ZHS.Nav.jumpTo(_firstUndone);
+            await U.sleep(3000);   // 等切换加载（与 resume.restore 同等待遇）
+          } else {
+            ZHS.Log.info('进入课程：当前节已学完，但目录里没有可跳的未学节，保持现状');
+          }
+        }
+      } catch (e) {
+        ZHS.Log.warn('进入即跳首节未学失败（已忽略，交给调度器后续处理）：' + e.message);
+      }
+    }
+
+    // 6. 当前课时标识 + 绑定进度记录
+    const cur = ZHS.Catalog.current();
+    ZHS.state.lessonKey = cur ? ZHS.Catalog.itemTitle(cur) : ZHS.Catalog.itemTitle(ZHS.Catalog.items()[0]);
+    ZHS.Log.info('当前课时：' + ZHS.state.lessonKey);
+    ZHS.Resume.bindVideo(video, ZHS.state.courseId, ZHS.state.lessonKey);
+
+    // 7. 开跑（顺序播放面板：尊重上次的「停止」状态）
+    if (window.__ZHS_SEQ_PAUSED__) {
+      ZHS.Log.info('上次是「停止」状态，本次不自动开始；点面板「启动」继续');
+    } else {
+      ZHS.Scheduler.start();
+    }
+
+    const stats = ZHS.Catalog.stats();
+    ZHS.Log.info('课程进度：' + stats.done + '/' + stats.total + ' (' + stats.percent + '%)');
+    // 成功初始化后给一个明确提示，让用户确信「脚本装上了、在干活」（回应面板首跑可见性）
+    if (ZHS.panel) {
+      if (window.__ZHS_SEQ_PAUSED__) ZHS.panel.alert('面板已就绪（上次为「停止」状态，点「启动」继续）', 'info', 5000);
+      else ZHS.panel.alert('智慧树助手已就绪，开始自动学习', 'info', 4000);
+    }
+    ZHS.Log.info('=== 初始化完成 ===');
+  }
+
+  /** SPA 路由变化监听：DOM 重建后重新初始化 */
+  function watchSpa() {
+    const onDomChange = U.debounce(() => {
+      // 切课检测：courseId 变了（SPA 不刷新页面直接换课）→ 重置目录缓存与断点上下文，
+      // 否则会残留旧课程的 courseId/lessonKey，导致 gotoNext 跳错节或把进度记到别的课。
+      const newCourseId = ZHS.Catalog.getCourseId();
+      if (newCourseId && newCourseId !== 'unknown-course' && newCourseId !== ZHS.state.courseId) {
+        ZHS.Catalog.resetCatalogCache();
+        ZHS.state.courseId = newCourseId;
+        ZHS.Log.info('检测到切换课程，已重置目录缓存与断点上下文 → ' + newCourseId);
+      }
+      // 当前课时变化（同课程内切章节，或切课后）同步 state，避免 gotoNext 用旧 lessonKey 定位错节
+      const cur = ZHS.Catalog.current();
+      const newLessonKey = cur ? ZHS.Catalog.itemTitle(cur) : null;
+      if (newLessonKey && newLessonKey !== ZHS.state.lessonKey) {
+        ZHS.state.lessonKey = newLessonKey;
+        ZHS.Log.debug('当前课时更新：' + newLessonKey);
+      }
+
+      // 视频元素被替换 → 重新绑定，但不重启整套流程
+      const v = document.querySelector('video');
+      if (v && v !== ZHS.state.videoEl) {
+        ZHS.Log.debug('检测到视频元素变化，重新绑定');
+        ZHS.state.videoEl = v;
+        bootTries = 0; // round-11：视频重新出现时重置 boot 名额，避免 SPA 切集后永久失活
+        if (newLessonKey) ZHS.state.lessonKey = newLessonKey;
+        ZHS.Resume.bindVideo(v, ZHS.state.courseId, ZHS.state.lessonKey);
+      }
+      // 页面还没初始化但出现视频 → 补启动（含启动失败后的重试，受次数上限约束）
+      if (!initialized && bootTries < BOOT_MAX_TRIES && v) boot();
+      // round-14：瞬时故障（目录临时读不到 / 节点临时定位不到 / 连点无反应）导致的停机，
+      // 在视频恢复后允许受限自愈重启；用户主动停 / 达标停不受影响（内部有原因判定与冷却/次数上限）
+      if (ZHS.Scheduler && ZHS.Scheduler.tryResumeAfterTransientStop) {
+        ZHS.Scheduler.tryResumeAfterTransientStop();
+      }
+    }, 1000);
+
+    try {
+      const obs = new MutationObserver(onDomChange);
+      obs.observe(document.documentElement, { childList: true, subtree: true });
+    } catch (e) {
+      ZHS.Log.debug('MutationObserver 启动失败：' + e.message);
+    }
+  }
+
+  // ===== 启动时机 =====
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', () => { boot(); watchSpa(); });
+  } else {
+    boot();
+    watchSpa();
+  }
+
+  // 暴露手动控制
+  window.zhs = {
+    boot,
+    start: () => { window.__ZHS_SEQ_PAUSED__ = false; return ZHS.Scheduler.start({ manual: true }); },
+    stop: () => ZHS.Scheduler.stop(),
+    config: (p) => ZHS.setConfig(p),
+    next: () => ZHS.Scheduler.gotoNext('手动', { manual: true }),
+    // v0.6.64：手动跳到指定课时。target = 第 N 节（数字/数字串）或标题子串。
+    gotoLesson: (target) => ZHS.Scheduler.gotoLesson(target, { manual: true }),
+    // v0.6.64：在课程中心页手动触发「自动学习」——立即选一门未学完的课进入。
+    // 与面板「找下一门课」按钮同源；autoLearn 开着时进课程中心本就会自动跑，此处供手动/控制台补触。
+    learn: async () => {
+      if (ZHS.CourseHub && ZHS.CourseHub.triggerManual) return ZHS.CourseHub.triggerManual();
+      return false;
+    },
+    clearResume: () => ZHS.Resume.clear(ZHS.state.courseId),
+    logs: () => ZHS.Log.all(),
+    stats: () => ZHS.Catalog.stats(),
+  };
+})();
+
+/* ===== 08-questions.js ===== */
+/**
+ * 题目采集层：从三种场景抽取结构化题目
+ *
+ * 场景 A：课中弹题   #playTopic-dialog
+ * 场景 B：共享课作业  .subject_node
+ * 场景 C：hike 作业/考试  .q_main
+ */
+(function () {
+  'use strict';
+  const ZHS = window.ZHS;
+  if (!ZHS || !ZHS.Util) return;
+  // 重入守卫：SPA 二次注入时整个模块直接退出，避免定时器/监听器叠加
+  if (ZHS.__mod08_questions) return;
+  ZHS.__mod08_questions = true;
+  const U = ZHS.Util;
+
+  /** 内部题型枚举 */
+  const TYPE = {
+    SINGLE: 'single',       // 单选
+    MULTIPLE: 'multiple',   // 多选
+    JUDGEMENT: 'judgement', // 判断
+    COMPLETION: 'completion', // 填空
+    QA: 'qa',               // 简答
+    UNKNOWN: 'unknown',
+  };
+
+  /** 题库 API 的 type 编码：0单选 1多选 2填空 3判断 4问答 */
+  const BANK_TYPE = {
+    [TYPE.SINGLE]: 0,
+    [TYPE.MULTIPLE]: 1,
+    [TYPE.COMPLETION]: 2,
+    [TYPE.JUDGEMENT]: 3,
+    [TYPE.QA]: 4,
+    [TYPE.UNKNOWN]: 0,
+  };
+
+  /** 文本 → 内部题型 */
+  function guessType(text, options) {
+    const t = String(text || '');
+    if (t.includes('多选')) return TYPE.MULTIPLE;
+    if (t.includes('单选')) return TYPE.SINGLE;
+    if (t.includes('判断')) return TYPE.JUDGEMENT;
+    if (t.includes('填空')) return TYPE.COMPLETION;
+    if (t.includes('简答') || t.includes('问答')) return TYPE.QA;
+
+    // 从选项文本推断：只有"对/错"就是判断题
+    if (options && options.length === 2) {
+      const joined = options.join('');
+      if (/^(对|正确|是|T|True)/i.test(joined) && /(错|错误|否|F|False)/i.test(joined)) {
+        return TYPE.JUDGEMENT;
+      }
+    }
+    // 选项 4 个以上且文本以 A. B. 开头 → 单选兜底
+    if (options && options.length >= 2) return TYPE.SINGLE;
+    return TYPE.UNKNOWN;
+  }
+
+  /** 安全取元素文本：优先 innerText，降级 textContent（jsdom 不实现 innerText） */
+  function readText(el) {
+    if (!el) return '';
+    const t = el.innerText !== undefined && el.innerText !== null ? el.innerText : el.textContent;
+    return U.normText(t || '');
+  }
+
+  /** 图片延迟加载处理：智慧树把真实地址放 data-src */
+  function hydrateImages(root) {
+    if (!root) return;
+    const imgs = root.querySelectorAll('img');
+    for (const img of imgs) {
+      if (img.dataset && img.dataset.src && !img.src) {
+        img.src = img.dataset.src;
+      } else if (img.dataset && img.dataset.src && img.src !== img.dataset.src) {
+        img.src = img.dataset.src;
+      }
+    }
+  }
+
+  /** 判断元素内是否有图片（用于决定要不要 OCR） */
+  function hasImage(root) {
+    if (!root) return false;
+    return root.querySelectorAll('img').length > 0;
+  }
+
+  /**
+   * 场景 A：课中弹题
+   * 结构：#playTopic-dialog 内 .el-pager .number 分页
+   */
+  /**
+   * 弹题容器选择器（单一真源取自 ZHS.Const，字面量兜底防加载顺序异常）。
+   * 必须与 src/05-scheduler.js 的守卫 2 判据逐字一致，否则会出现
+   * 「调度器认为有弹题 / 答题器找不到容器」或反过来的错位，脚本对弹窗毫无反应。
+   */
+  const DIALOG_SELECTORS = (ZHS.Const && ZHS.Const.QUESTION_SELECTORS)
+    || '#playTopic-dialog, [class*="topic-dialog"], .el-dialog__wrapper .el-dialog';
+
+  /** 选项类元素（用于判断一个弹窗「是不是题」） */
+  const OPTION_FEATURE_SELECTORS = '.el-radio, .el-checkbox, [role="radio"], [role="option"],'
+    + ' .option-item, .choice-item, .answer-option, ul li, .option';
+  /** 题干类元素（同上） */
+  const TITLE_FEATURE_SELECTORS = '.topic-title, .topic-content, .question-topic,'
+    + ' .el-dialog__title, .topic-question';
+
+  /**
+   * 选项文本识别正则（方案 A，round-19 P1 修复）。
+   *
+   * 旧正则 `^([abAB][.、,:：)]?\s|...)` 里的 `\s` **不在 `?` 可选范围内**，
+   * 即「A/B 后面必须再跟一个空白」才算匹配。实际后果：`"A"`、`"A."`、`"A.对"`、
+   * `"A、对"` 全部落空 → 按钮式弹窗读不到选项 → 又只能乱猜（P1 复现）。
+   *
+   * 现在拆成四类分支（任一命中即算选项样文本）：
+   *   ① `[abAB][分隔符]?\s*$`   —— 单独一个 A/B，可带分隔符、可带尾随空白（"A" / "A." / "A、"）
+   *   ② `[abAB][分隔符]\s*\S`   —— A/B + 分隔符 + 任意内容（"A.对" / "A、对" / "A. 说法"）
+   *   ③ `[abAB](?!字母)[空白或标点][^字母数字]\s*(?![A-Za-z])\S` —— A/B + 分隔符 + 非拉丁开头内容
+   *                              覆盖 "A 说法"/"A、对"；"A group"/"A 组" 因内容以拉丁字母开头被排除
+   *   ④ 关键字：对/错/正确/错误/是/否/√/× 收尾或开头（判断题常见）
+   *
+   * 误报控制（实测已验证，见 CHANGELOG）：`"Apple"` / `"About"` / `"A组"` / `"A货"` / `"AB"`
+   * 均**不匹配** —— 因为 A/B 之后要么是行尾/分隔符，要么必须是空白+非字母数字，
+   * 直接跟字母/汉字（"A组"）不满足任何一个分支。
+   */
+  const OPTION_TEXT_RE = new RegExp(
+    '^(?:[abAB][.、,:：)）]?\\s*$'                       // ① 纯 A/B（可带分隔符与尾空白）
+    + '|[abAB](?![\\p{L}])[.、,:：)）]\\s*\\S'            // ② A/B + 分隔符 + 内容
+    + '|[abAB](?![\\p{L}])[.、,:：)）]?[^\\p{L}\\p{N}]\\s*(?![a-zA-Z])\\S' // ③ A/B + 空白/标点 + 非拉丁字母内容（"A 说法"，排除 "A group"）
+    + '|对$|错$|正确|错误|是$|否$|√|×)',                 // ④ 判断类关键字
+    'u'
+  );
+
+  /** 操作词：这些同款成组的按钮是页脚操作栏，不是选项（供结构对称判据排除） */
+  const ACTION_WORDS = ['关闭', '确定', '提交', '取消', '我知道了', '知道了', '继续学习',
+    '下一题', '上一题', '确认', '返回', '提交答案'];
+
+  /**
+   * 导航/流程词：**无论如何都不可能是选项**，混进选项组必须逐个摘掉。
+   * 与 ACTION_WORDS 的区别：ACTION_WORDS 里的「确定/关闭」在极少数真题里可能正好是选项文本
+   * （见测试⑩「确定 / 不正确」），而「上一题/下一题/继续学习」永远只可能是导航控件 ——
+   * 一旦它们出现在选项组里，要么是混入（摘掉即可），要么整组就是导航条（摘完剩 0/1 → 弃用）。
+   */
+  const NAV_WORDS = ['上一题', '下一题', '继续学习', '返回', '我知道了', '知道了', '提交答案'];
+
+  /**
+   * 题目**元信息标签**正则（round-23 新增）—— 整组命中即弃用。
+   *
+   * 为什么需要：题干之后紧跟的往往是「题型 / 分值 / 难度」这类元信息，且它们
+   * **同父、同 tag、同 class**（如 `<div class="tag">单选题</div><div class="tag">2分</div>`），
+   * 满足结构对称判据 → 会被方案 B/C/D 当成选项组。实测：0.6.25 方案 D 主路径短路时，
+   * 这种组会**顶掉真正的选项**（返回 `["单选题","2分"]`），把元信息当答案送去解题。
+   * 判据放在 `_cleanGroup`（B/C/D 共用管线），三条通道一起受益。
+   */
+  const META_RE = /^(单选题|多选题|判断题|填空题|简答题|选择题|不定项选择题|\d+\s*分|难度[:：]?.*|【.*】)$/;
+
+  /** 方案 C 结构对称自动发现的深度上限：只扫 scope 下 ≤ N 层的节点，控制主循环开销 */
+  const AUTO_MAX_DEPTH = 6;
+
+  /** 深度触顶日志只打一次（避免每轮刷屏） */
+  let _depthWarned = false;
+
+  /**
+   * 组件噪声黑名单（方案 C 兜底判据）—— 命中即整组弃用。
+   *
+   * 为什么还要这条兜底：分页器 / 步骤条 / 选项卡 / 面包屑 / 视频控制条
+   * 天生就是「同父 + 同 tag + 同 class + 数量 3~4」的整齐对称结构，
+   * 在方案 C（全树猜测）里会压过只有 2 项的真选项。
+   *
+   * 【round-22 P1① 修正 —— 只顾自身，不再爬祖先链】
+   * 旧实现从元素自身一路爬到 40 层祖先，逐个 className 匹配。实测致命后果：
+   * 弹题弹窗极度可能**嵌在播放器容器（`video-js` / `prism-player`）内部**，
+   * 于是一旦祖先里有 `video-js`，弹窗内**所有真选项**都被判成噪声 → `texts=[]` → 全平台弹题读不到。
+   * 同理，选项自身 class 恰好叫 `el-menu-item` 也会被误杀。
+   * 现在方案 D（题干锚定）用**位置先验**排除噪声，黑名单只需兜「元素自己就长得像导航件」，
+   * 所以**只看元素自身的 className**，不再爬祖先链 —— 把「祖先是不是播放器」这种事交给位置判据。
+   *
+   * 匹配方式：对元素自身 className 做**分词精确匹配**
+   * （`(' '+cls+' ').includes(' '+name+' ')`）—— 比子串安全，`el-step` 不会误伤 `el-stepper`。
+   */
+  const NOISE_CLASSES = ['el-pager', 'el-step', 'el-steps', 'el-tabs__item', 'el-tabs__nav',
+    'el-breadcrumb', 'el-rate', 'el-menu', 'el-menu-item', 'el-pagination', 'el-carousel',
+    'el-collapse-item', 'el-timeline-item', 'vjs-control-bar', 'vjs-control', 'prism-player',
+    'video-js', 'dplayer', 'artplayer', 'plyr__controls', 'courseware-menu'];
+
+  /** 元素**自身**的 className 命中噪声名单 → true（只看自身，不爬祖先，见上方 P1① 说明） */
+  function inNoiseContainer(el) {
+    if (!el) return false;
+    const cls = el.className;
+    if (typeof cls !== 'string' || !cls) return false;
+    const padded = ' ' + cls.split(/\s+/).filter(Boolean).join(' ') + ' ';
+    for (let i = 0; i < NOISE_CLASSES.length; i++) {
+      if (padded.indexOf(' ' + NOISE_CLASSES[i] + ' ') >= 0) return true;
+    }
+    return false;
+  }
+
+  /**
+   * 判断题符号白名单（供 `looksLikeNoiseTexts` 与 `isSingleNoiseToken` 共用）。
+   * 与 `OPTION_TEXT_RE` 第 ④ 分支保持一致：这几个符号是判断题的合法选项。
+   */
+  const JUDGE_SYMBOLS = ['√', '×', '✓', '✗'];
+
+  /**
+   * 内容形状过滤 —— 判断一组文本「像不像答案」。
+   * 传入已摘除噪声成员后的文本数组，返回 true 表示该组**应当弃用**：
+   *   - 组内**全部**为纯数字 `/^\d+$/` → 是分页器（1/2/3）
+   *   - 组内**全部**为纯符号 `/^[^\p{L}\p{N}]+$/u` 且**不含判断题符号** → 是图标组（‹ › × …）
+   *
+   * 【round-22 P1④ 修正】判断题选项「√ / ×」本身也是纯符号，若一律按符号组否决，
+   * 会与 `OPTION_TEXT_RE`（第 ④ 分支明确收 √ ×）以及 `isSingleNoiseToken`（已白名单放行）矛盾。
+   * 因此这里先把判断题符号排除出「符号组」判定：一组全是 √/× 时**不**判噪声。
+   */
+  function looksLikeNoiseTexts(texts) {
+    if (!texts.length) return true;
+    if (texts.every((t) => /^\d+$/.test(t))) return true;                 // 全数字 → 分页器
+    const allSymbol = texts.every((t) => /^[^\p{L}\p{N}]+$/u.test(t));
+    const anyJudge = texts.some((t) => JUDGE_SYMBOLS.indexOf(t) >= 0);
+    if (allSymbol && !anyJudge) return true;                             // 全符号且非判断题符 → 图标组
+    return false;
+  }
+
+  /**
+   * 成员级噪声 token 判定（方案 C 兜底判据的成员级补充）。
+   *
+   * 为什么不能简单用 `text.length <= 1` 一刀切（round-22 性能用例回归教训）：
+   * 「甲」「乙」这类**单个汉字**是极常见的合法选项文本，长度也是 1；
+   * 用长度一刀切会把它误判成噪声 → `_autoSiblings` 整组读空 → 性能/真题双双失败。
+   * 真正该挡的是**形状**而非长度。
+   *
+   * 【round-22 P1④ 修正 —— 与 `OPTION_TEXT_RE` 保持一致】
+   *  `OPTION_TEXT_RE` 第 ④ 分支明确把 `√ | ×` 当选项（判断题专用），
+   *  而本函数原先返回 `true`（判噪声）→ **两条判据自相矛盾**：真选项「√/×」被自己人杀掉。
+   *  现在加判断题符号白名单 `√ × ✓ ✗`，明确放行。
+   * 【round-22 P1④ 修正 —— 删掉单数字分支】
+   *  「组内全是纯数字」已由 `looksLikeNoiseTexts` 在**组级**挡掉；成员级再挡「单数字」属重复过严，
+   *  会把「选项组 = ["1","说法二"]」这种真题误杀（测 25）。故删除 `/^\d$/` 分支。
+   *  保留「单符号」弃用（「?」「›」这种确实不是选项）。
+   *
+   * @param {string} text 已 trim 的文本
+   * @returns {boolean} true 表示该成员是噪声 token，应导致本组不可用
+   */
+  function isSingleNoiseToken(text) {
+    if (!text) return true;
+    if (JUDGE_SYMBOLS.indexOf(text) >= 0) return false;   // 判断题符号 → 合法选项
+    if (text.length !== 1) return false;
+    if (/^[^\p{L}\p{N}]$/u.test(text)) return true;       // 单符号（非判断题符） → 图标
+    return false;                                         // 单字母/单汉字/单数字 → 合法选项
+  }
+
+  /**
+   * 选项组打分（方案 C 兜底判据）—— 分高者胜，取代旧的「谁长谁赢」。
+   *
+   * 为什么必须换掉「长度优先」：任何 3~4 项对称结构（分页器/步骤条/选项卡/面包屑/控制条）
+   * 天生比 2 项真选项长，长度优先等于「噪声必胜」。
+   *
+   * 【round-22 P1② 修正 —— 权重单调化，前缀奖励绝不可能超过项数基数差】
+   * 旧权重 `2项=100 / 3项=30 / 4项=10，前缀每个+40`：实测
+   * `[3项带 A./B./C. 前缀] = 30 + 120 = 150` **盖过** `[2项真选项] = 100 + 0 = 100`
+   * → 点了面包屑上的「A. 首页」。根因是**前缀奖励能压过项数基数**。
+   * 现改为（2 项必须绝对优先，因为 A/B 单选是主场景）：
+   *   - 项数基数：2 项 = 1000 / 3 项 = 300 / 4 项 = 100
+   *   - 前缀奖励：每个 +10，**最多计 2 个**（上限 +20）
+   *   - 文本长度：lenSum / 100（弱信号）
+   *   - **不再用 depth 当 tie-break**（深度是噪声的帮凶：越深的噪声越占优）
+   *
+   * 单调性约束（测 21 断言）：`2项无前缀最小分 1000` **>** `4项满前缀最大分 100+20+len/100`。
+   * 4 项文本最多 4×200=800 字符 → len/100 ≤ 8 → 上限 128 < 1000 ✓。
+   *
+   * @param {string[]} texts 组内（已清洗）文本
+   * @param {number} depth 该组相对 scope 的深度（保留入参兼容调用方，不再参与打分）
+   * @returns {number} 得分
+   */
+  function scoreOptionGroup(texts, depth) { // eslint-disable-line no-unused-vars
+    const n = texts.length;
+    let score = 0;
+    if (n === 2) score += 1000;
+    else if (n === 3) score += 300;
+    else score += 100;
+    let prefixed = 0;
+    for (const t of texts) if (OPTION_TEXT_RE.test(t)) prefixed++;
+    score += Math.min(prefixed, 2) * 10;   // 上限 +20，永远压不过 2 项基数 1000
+    let lenSum = 0;
+    for (const t of texts) lenSum += Math.min(t.length, 200);
+    score += lenSum / 100;
+    return score;
+  }
+
+  /**
+   * 父节点身份分配器（用于分组键）。
+   *
+   * 为什么不能用 `indexOf(p)` 当父身份：`indexOf(p)` 是「父在它自己的父里的下标」。
+   * 两个完全无关的容器，只要各自都是其父的第 0 个子，下标就都是 0 → 分组键相同 → 被并成一组
+   * （跨父串组，P1）。用 WeakMap 给每个父节点分配全局唯一序号，才是真正的「父身份」。
+   * WeakMap 在元素被回收时自动释放，reset 时无需清理。
+   */
+  const _parentSeq = new WeakMap();
+  let _parentSeqCounter = 0;
+  function parentIdOf(el) {
+    if (!el || (typeof el !== 'object' && typeof el !== 'function')) return 0;
+    let v = _parentSeq.get(el);
+    if (v === undefined) { v = ++_parentSeqCounter; _parentSeq.set(el, v); }
+    return v;
+  }
+
+  /**
+   * 内联样式可见性：只查 `style` 属性，**不调 getComputedStyle**。
+   *
+   * 为什么不调 getComputedStyle：jsdom 没有布局引擎，getComputedStyle 拿不到
+   * 由样式表级联出来的 display:none，会给出错误答案；而平台真实关闭弹窗时
+   * 往往是把 display:none 直接写在 inline style 上（Element UI 的 wrapper 就是这样）。
+   * 只查 inline style 在两种环境里行为一致。
+   *
+   * 检查范围：元素自身 + 整条祖先链。因为 Element UI 关闭时隐藏的是
+   * `.el-dialog__wrapper`（.el-dialog 的父节点），只查元素自身会漏判 → 误报「弹窗关不掉」。
+   */
+  function hasInlineHidden(el) {
+    let node = el;
+    while (node && node.style) {
+      const display = node.style.display;
+      const vis = node.style.visibility;
+      if (display === 'none' || vis === 'hidden') return true;
+      node = node.parentElement;
+    }
+    return false;
+  }
+
+  /** 元素是否「结构可见」且未通过 inline style 隐藏 */
+  function visibleForDialog(el) {
+    if (!el) return false;
+    if (!U.isStructurallyVisible(el)) return false;
+    return !hasInlineHidden(el);
+  }
+
+  /**
+   * 给一个弹窗容器打「题目特征」分（分越高越像一道题）。
+   *   3 = 同时有题干 + 选项（最像题）
+   *   2 = 只有选项
+   *   1 = 只有题干
+   *   0 = 都不是（公告/提示/设置窗之类）
+   */
+  function questionScore(el) {
+    // round-39b：AI 助教随堂练习容器（双变体）本身就是一道题，直接保底 ≥2 分，
+    // 免得它的选项是自定义 .option（不在传统特征里）时被误判成"不是题"→ root() 漏掉。
+    let aiBonus = 0;
+    try { if (el.matches && el.matches('.ai-test-question-wrapper, .ai-class-exercise-dialog')) aiBonus = 2; } catch (e) { /* 忽略 */ }
+    const hasOpt = !!el.querySelector(OPTION_FEATURE_SELECTORS);
+    const hasTitle = !!el.querySelector(TITLE_FEATURE_SELECTORS);
+    let s = 0;
+    if (hasOpt && hasTitle) s = 3;
+    else if (hasOpt) s = 2;
+    else if (hasTitle) s = 1;
+    return Math.max(s, aiBonus);
+  }
+
+  /**
+   * 真实知到「AI助教小智」弹题的题干提取兜底。
+   * 题干只是 .el-dialog__body 里的一段普通 <p>，没有 .topic-title；标准选择器取不到时
+   * readCurrent 会退回 .el-dialog__title 拿到「弹题测验」→ 求解器等于没题干。
+   */
+  function extractDialogStem(r) {
+    try {
+      const body = r.querySelector('.el-dialog__body') || r;
+      const optNode = body.querySelector('ul, .topic-item');
+      const optBox = optNode
+        ? (optNode.tagName === 'UL' ? optNode : (optNode.closest('ul') || optNode.parentElement))
+        : null;
+      const BOILER = /AI助教小智|不会影响到大家|弹题是为了帮助|不影响.{0,8}(作业|考试)|随时点我|^正确【|^【?(单选题|多选题|判断题)】?$|^(弹题测验|课中答题|答题|弹题)$/;
+      const blocks = [];
+      const all = body.querySelectorAll('p, div, span, li, h1, h2, h3, h4, h5, h6');
+      for (const el of all) {
+        if (optBox && (el === optBox || optBox.contains(el) || el.contains(optBox))) continue;
+        if (el.querySelector('ul, li, .topic-item, button, .btn, .el-pager')) continue;
+        const t = readText(el);
+        if (!t || t.length < 4 || t.length > 300) continue;
+        if (BOILER.test(t)) continue;
+        const before = !!(optBox && (el.compareDocumentPosition(optBox) & 4));
+        blocks.push({ t, before });
+      }
+      if (!blocks.length) return '';
+      const pool = blocks.some((b) => b.before) ? blocks.filter((b) => b.before) : blocks;
+      let best = '';
+      let score = -1;
+      for (const b of pool) {
+        let s = b.t.length;
+        if (/[？?]|（）|\(\)|下列|关于|以下|正确|错误|说法|是[（(]/.test(b.t)) s += 30;
+        if (s > score) { score = s; best = b.t; }
+      }
+      return best;
+    } catch (e) {
+      return '';
+    }
+  }
+
+  const DialogQuestions = {
+    /**
+     * 弹题容器（考虑 iframe 情况）。
+     *
+     * 【2026-09-19 修正】不再「取第一个匹配的 .el-dialog」——
+     * 真实页面里设置窗/公告/提示弹窗同样用 .el-dialog，谁排在前面谁被选中：
+     * 拿到设置窗 → 题干读成"设置"、选项读到设置项；更糟的是 present() 返回 false
+     * 而调度器守卫（扫全量选择器）返回 true → 两侧判据错位，误报「请手动选 A 或 B」
+     * 并暂停视频空跑。现改为遍历全部候选，选「题目特征分最高」的那个；
+     * 分数相同取文档序第一个（多个都是题时取第一个，行为可预期）。
+     */
+    root() {
+      const candidates = Array.from(document.querySelectorAll(DIALOG_SELECTORS))
+        .filter((el) => visibleForDialog(el));
+      let best = null;
+      let bestScore = -1;
+      for (const el of candidates) {
+        const s = questionScore(el);
+        if (s > bestScore) { best = el; bestScore = s; }
+      }
+      // 有明确「像题」的候选就返回它；一个都不是题（全是公告/设置窗）则整体判无弹题，
+      // 绝不能退回「随便拿一个弹窗」——那正是错位的根源。
+      if (best && bestScore > 0) return best;
+      if (best) return null;
+
+      // 关键坑：弹题可能渲染在 iframe 里
+      const iframe = document.getElementById('tmDialog_iframe');
+      if (iframe) {
+        try {
+          const doc = iframe.contentDocument || iframe.contentWindow.document;
+          const inner = doc && doc.querySelector('#playTopic-dialog, [class*="topic-dialog"], .topic-title');
+          if (inner && visibleForDialog(inner)) return doc;
+        } catch (e) {
+          ZHS.Log.debug('弹题 iframe 跨域，无法访问');
+        }
+      }
+      return null;
+    },
+
+    /**
+     * 是否出现弹题。
+     *
+     * 判据必须与调度器的守卫对齐：守卫用 `hasStructurallyVisible(QUESTION_SELECTORS)`
+     * 扫**全量**匹配元素，所以这里也要「存在任一『像题的』可见弹窗即 true」，
+     * 不能只看第一个（否则多弹窗并存时守卫放行、答题器却说没有，判据错位）。
+     */
+    present() {
+      const list = Array.from(document.querySelectorAll(DIALOG_SELECTORS))
+        .filter((el) => visibleForDialog(el));
+      if (list.some((el) => questionScore(el) > 0)) return true;
+      // 部分版本弹题在 #tmDialog_iframe 里（docs/03 坑 10）：顶页判据会漏，
+      // 这里补一次 iframe 内扫描，调度器守卫 2 才不会「看不见弹题」。
+      const ifr = document.getElementById('tmDialog_iframe');
+      if (ifr) {
+        try {
+          const doc = ifr.contentDocument || (ifr.contentWindow && ifr.contentWindow.document);
+          if (doc) {
+            const inner = Array.from(doc.querySelectorAll(DIALOG_SELECTORS)).filter((el) => visibleForDialog(el));
+            if (inner.some((el) => questionScore(el) > 0)) return true;
+            const one = doc.querySelector('#playTopic-dialog, [class*="topic-dialog"], .topic-title');
+            if (one && visibleForDialog(one)) return true;
+          }
+        } catch (e) { ZHS.Log.debug('弹题 iframe 跨域，无法扫描'); }
+      }
+      return false;
+    },
+
+    /**
+     * 直接从弹题 DOM 里读平台给出的正确答案（AI 助教小智「弹题测验」专用）。
+     *
+     * 真机依据（round-26 实测）：AI 助教小智出的巩固弹题，会把答案以纯文本
+     * 「正确答案：A」的形式**直接渲染在弹窗里**（同一弹窗还写明「不影响作业
+     * 考试成绩」）。这类题既不需要查题库、也不需要调 LLM —— 读出来直接用，
+     * 零延迟、零成本、零失败率。
+     *
+     * 它还有个关键性质：**不做选择也能关闭**。实测点选项 A 后其 class 仍是
+     * topic-item（选中态根本不会变），所以调度器旧的「平台不允许关闭未作答弹题、
+     * 必须答上才关」这条铁律，会把它卡成「关不掉 → 转人工空等」的死循环。
+     * 有了本方法读出答案，就可以放心直接关闭并续播。
+     *
+     * @returns {string|null} 答案文本（如 'A' / 'AB' / '对'）；页面没给答案返回
+     *   null，调用方应回退到题库/LLM 链路。
+     */
+    answerFromDom() {
+      const r = this.root();
+      if (!r) return null;
+      let scope = r;
+      try {
+        // 答案文本可能挂在 .el-dialog__wrapper 上，而不在 .el-dialog 内部 → 扩大到整个弹窗
+        const w = r.closest ? r.closest('.el-dialog__wrapper') : null;
+        if (w) scope = w;
+      } catch (e) { /* 取不到就保持 scope = r */ }
+      let txt = '';
+      try { txt = U.normText(scope.textContent || ''); } catch (e) { txt = ''; }
+      if (!txt) return null;
+      const m = txt.match(/正确答案\s*[：:]\s*([A-Ha-h]{1,8}|对|错|正确|错误)/);
+      if (!m) return null;
+      return m[1];
+    },
+
+    /**
+     * 采集所有分页的题目
+     * 返回 [{ title, options[], type, pageIndex, elements }]
+     */
+    collect() {
+      const root = this.root();
+      if (!root) return [];
+
+      const pages = Array.from(root.querySelectorAll('.el-pager .number'));
+      const results = [];
+
+      // 题干（弹题通常所有分页共享一个题干区，或每页一个）。
+      // 【2026-09-19】必须复用 readCurrent 的题干/选项读取逻辑：
+      // collect() 的 title 被 Answerer 拿去当**去重签名**（handleDialog 里
+      // `JSON.stringify(snapshot.map(s => s.title))`），若这里读不到 Element UI 弹窗的题面，
+      // 每一道 .el-dialog 题都会产出同一个空签名 '[""]' —— 结果是「答完第一道 A/B 弹题后，
+      // 后续任意弹题都被当成已作答跳过」，用户侧表现就是「只有第一道题会答」。
+      // 因此这里改为调用 readCurrent，保证与真正作答时读到的题面完全一致。
+      const cur = this.readCurrent(root);
+      const sharedTitle = (cur && cur.title) || '';
+      const sharedOptEls = (cur && cur.elementList) || [];
+      const sharedOpts = (cur && cur.options) || [];
+
+      if (pages.length) {
+        // 有分页：逐页收集（注意：这里只读文本，切换分页由答题器负责）
+        pages.forEach((p, i) => {
+          results.push({
+            title: sharedTitle,
+            options: [],
+            type: TYPE.UNKNOWN,
+            pageIndex: i,
+            totalPages: pages.length,
+            elements: { page: p, root },
+            raw: '',
+          });
+        });
+      } else {
+        // 无分页：单题
+        results.push({
+          title: sharedTitle,
+          options: sharedOpts,
+          type: guessType(sharedTitle, sharedOpts),
+          pageIndex: 0,
+          totalPages: 1,
+          elements: { page: null, root },
+          elementList: sharedOptEls,
+          raw: '',
+        });
+      }
+      return results;
+    },
+
+    /**
+     * 去重 + 归属净化：从原始命中列表里挑出「真正的同级选项」，丢掉两种噪声。
+     *
+     * 背景（2026-09-19 用户报「脚本没有在答这种题，只是乱点」）：
+     * 旧选择器 `... .el-radio, .radio > label, ...` 里 `.el-radio` 与 `.radio > label`
+     * 会**同时命中同一个选项**（Element UI 的 .el-radio 外层就是 label）→ 列表变成 [A,B,A,B]，
+     * 按答案算出的索引会点到错误位置甚至同一项点两次（可能把已选中项点成取消）。
+     *
+     * 去重规则（两步）：
+     *  1. 包含关系：若 el 被同批另一个元素 contains，说明 el 是那个元素的子孙/宿主，
+     *     只保留更外层/更完整的那个，丢 el。
+     *  2. 文本去重：同批里出现完全相同的文本，只保留第一个（纯属选择器重叠产生的重影）。
+     */
+    _dedupeOptions(list) {
+      const noNested = list.filter((el) => !list.some((other) => other !== el && other.contains(el)));
+      const seen = new Set();
+      return noNested.filter((el) => {
+        const t = readText(this._textHost(el));
+        if (seen.has(t)) return false;
+        seen.add(t);
+        return true;
+      });
+    },
+
+    /**
+     * 取「该选项的文字应该从哪儿读」。
+     * Element UI 的 .el-radio 外层 label 里除了选项文字，还可能夹带按钮 / 角标等杂项文本，
+     * 因此有 `.el-radio__label` / `.el-checkbox__label` 子节点时优先取它，否则退回整个元素。
+     *
+     * 【2026-09-19 修正】优先取 `__label` 前必须**校验它有非空文本**。
+     * 有些平台结构里 `__label` 节点存在但内容为空（文字被放在兄弟节点），
+     * 此时 `querySelector(...) || el` 会因为节点存在而选中它 → 选项文本全变空字符串
+     * → 再被文本去重合并成 1 个 → 选项数从 2 变 1、索引错位、无法作答。
+     * 所以取到 `__label` 后要复查文本，为空就退回整个元素。
+     */
+    _textHost(el) {
+      if (!el || !el.querySelector) return el;
+      const label = el.querySelector('.el-radio__label, .el-checkbox__label');
+      if (label && readText(label)) return label;
+      return el;
+    },
+
+    /**
+     * 只读暴露宽口径正则，供测试直接断言其边界（不经过 readOptions 的对称兜底通道）。
+     * 为什么需要：32q 要锁死「\s 不能改回必需」这件事，若走 readOptions，
+     * 「Apple」会被方案B 的结构对称通道捡回来，正则本身的误报/漏报就测不出来了。
+     */
+    _optionTextRe() {
+      return new RegExp(OPTION_TEXT_RE.source, 'u');
+    },
+
+    /**
+     * 只读暴露打分函数，供测试直接断言权重单调性（测 21）。
+     * 为什么不通过 readOptions 间接测：打分是纯函数，直测才能锁死
+     * 「前缀奖励永远压不过项数基数」这条约束本身，而不是靠某个 DOM 巧合。
+     */
+    _scoreOptionGroup(texts, depth) {
+      return scoreOptionGroup(texts, depth);
+    },
+
+    /**
+     * 找题干元素（方案 D 的锚点）。选择器与 `readCurrent` 保持一致，抽成独立方法避免两处漂移。
+     * @returns {Element|null}
+     */
+    _findTitleEl(r) {
+      if (!r || !r.querySelector) return null;
+      try {
+        return r.querySelector(
+          '.el-dialog__body .question-topic, .el-dialog__body .topic-content,'
+          + ' .topic-title, .topic-content, .topic-question'
+        );
+      } catch (e) { return null; }
+    },
+
+    /**
+     * 【方案 D · 题干锚定】—— 用**位置先验**读选项，替代方案 C 的全树猜测。
+     *
+     * 为什么必须新增这条通道（round-22 收敛决策）：
+     * 五轮下来（0.6.19→0.6.24）方案 C 每加一层判据就冒一个新洞，根因是它在做
+     * **「全树无差别猜测」**——扫描整棵子树找「长得整齐的兄弟组」，没有任何位置先验。
+     * 噪声和选项在全树范围内是**平权**的，只能靠越来越长的黑名单碰运气。
+     * 但真实页面里**选项的位置是固定的**：题干（`titleEl`）读到了 → 选项就在
+     * **同一题目容器内、题干之后**。
+     *
+     * 【round-23 修正 —— 主路径不得短路】
+     * 旧实现「逐层向上，**第一圈命中就 return**」有个致命漏洞：`_siblingsAfter` 只在
+     * 「同一父节点的直接兄弟」里选组，而题干与噪声常常同父（如
+     * `<div class="wrap"><div class="q-title">…</div><div class="it">A. 上一节回顾</div><div class="it">B. 下一节预告</div></div>`
+     * 外面才套真选项容器）。此时第一圈就命中噪声并 return → **离题干近的噪声永远赢**，
+     * 哪怕它明显不像选项。方案 D 因此比方案 C 更危险（C 至少在全树里打分选优）。
+     * **修法**：主路径**逐层收集**所有候选组（不 return），与退化路径的候选一起
+     * **统一打分选优**；层级只作**极轻量 tie-break**（`- up * 0.1`，最大 0.5），
+     * 永远不可能翻转 `scoreOptionGroup` 的项数差（2 项 1000 vs 3 项 300）。
+     *
+     * 算法：
+     *   1. `titleEl` 为空 → 返回 `[]`（交给方案 A/B/C）。
+     *   2. 主路径：从 `titleEl.parentElement` 起逐层向上最多 5 层，每层用
+     *      `_siblingsAfter` 取该层「题干之后的对称组」→ **push 进候选池**（带层级 up）。
+     *   3. 退化路径：`scope` 内「题干之后的子树」按「父+tag+class」分组 → 同样 push 进池。
+     *   4. **独立容器优先（round-23 第二步）**：候选里「非题干行」（组父 ≠ 题干父）的若存在，
+     *      整批优先于「题干行」候选 —— 真选项有专属容器，噪声只会与题干同处一行（详见函数内注释）。
+     *   5. 统一打分：`score(total) = scoreOptionGroup(texts, 0) - up * 0.1`，取最高分。
+     *
+     * @param {Element} scope   弹窗容器
+     * @param {Element} titleEl 题干元素（可为 null）
+     * @returns {Element[]} 选项元素组；无则 []
+     */
+    _anchoredOptions(scope, titleEl) {
+      if (!scope || !titleEl) return [];
+      const MAX_UP = 5;
+      // 候选池：{ els, up, ownRow }
+      //   up     —— 离题干的层数（越小越近），仅作**极轻量** tie-break
+      //   ownRow —— 该组与题干**同父**（即「题干所在那一行」的兄弟组）
+      const cands = [];
+
+      // ---- 主路径：逐层向上**收集**（不短路），每层取该层最优对称组 ----
+      let node = titleEl.parentElement;
+      let up = 0;
+      while (node && node !== scope.parentElement && up <= MAX_UP) {
+        const found = this._siblingsAfter(node, titleEl);   // 内部已对本层候选打分
+        if (found.length >= 2) {
+          // 主路径的每一组，父节点都是题干当前层的父 → 与题干同父（ownRow = true）
+          cands.push({ els: found, up, ownRow: node === titleEl.parentElement });
+        }
+        node = node.parentElement;
+        up++;
+      }
+
+      // ---- 退化路径：题干之后的子树里找对称组（同样进候选池）----
+      // 为什么需要：真实布局里选项常被包在「题干之后的某个容器」（如 `.opt-list`）里，
+      // 与题干并不同父，主路径在同层找不到（该容器本身只有 1 个，凑不成组）。
+      if (scope.querySelectorAll) {
+        const after = [];
+        let seen = false;
+        try {
+          for (const el of scope.querySelectorAll('*')) {
+            if (el === titleEl) { seen = true; continue; }
+            if (seen && !titleEl.contains(el) && !el.contains(titleEl)) after.push(el);
+          }
+        } catch (e) { /* 选择器异常 → 放弃退化路径 */ }
+        const byKey = new Map();
+        for (const el of after) {
+          const p = el.parentElement;
+          if (!p) continue;
+          const gk = parentIdOf(p) + '|' + el.tagName + '\u0001' + (el.className || '');
+          if (!byKey.has(gk)) byKey.set(gk, []);
+          byKey.get(gk).push(el);
+        }
+        for (const g of byKey.values()) {
+          const cleaned = this._cleanGroup(g);
+          // 退化路径：组父节点若恰是题干同父，也算「题干行」；否则是独立选项容器
+          if (cleaned.length >= 2) {
+            const gp = cleaned[0] && cleaned[0].parentElement;
+            cands.push({ els: cleaned, up: MAX_UP + 1, ownRow: gp === titleEl.parentElement });
+          }
+        }
+      }
+
+      // ---- round-23 第二步：独立选项容器优先于「题干行」 ----
+      // 「题干行」= 与题干同父的兄弟组。它既可能是真选项（`<div class="topic-title">…</div>
+      // <div class="opt-item">甲</div><div class="opt-item">乙</div>` 直接并列），
+      // 也可能是**混在题干行里的噪声**（题干 + `A. 上一节课程回顾` + `B. 下一节课程预告`）。
+      // 二者的**内容分完全相同**（都 2 项），而噪声常带 A./B. 前缀+更长文本 → 内容分反而更高，
+      // `up` 的 0.1 级 tie-break（≤0.5）根本压不住（实测差 20.14，见 ㉖）。
+      // 关键结构先验：**真选项有自己专属的容器**（`.opt-list` / `.wrap2`…），噪声只会与题干同处一行。
+      // 因此：只要存在「非题干行」的候选组（≥2 项），就**优先取它**，把题干行的候选整批排除。
+      // 只在没有任何独立容器候选时才退回题干行 —— 这既修 ㉖（噪声被排除），
+      // 又不影响「题干与选项直接并列」的合法布局（此时不存在独立容器候选，仍走题干行）。
+      const offRow = cands.filter((c) => !c.ownRow);
+      const pool = offRow.length ? offRow : cands;
+
+      // ---- 统一打分选优：分数为主，层级为**极轻量** tie-break ----
+      let best = [];
+      let bestScore = -Infinity;
+      for (const c of pool) {
+        const texts = c.els.map((el) => readText(this._textHost(el)));
+        // 层级奖励 ≤ 0.5（5 层 × 0.1），永远不可能翻转项数差（2项 1000 vs 3项 300）
+        const score = scoreOptionGroup(texts, 0) - c.up * 0.1;
+        if (score > bestScore) { best = c.els; bestScore = score; }
+      }
+      return best.length >= 2 ? best : [];
+    },
+
+    /**
+     * 在 `parent.children` 中找「位于 `anchor` 之后、同 tag + 同 class」的一组兄弟（≥2）。
+     * 多个候选组时用**打分制**取最优（避免文档序靠前的噪声组先把真选项挤掉）。
+     *
+     * 【round-23 位置约束】候选组必须**整体位于题干之后**（DOM 序）——
+     * `kids.slice(ai + 1)` 已保证这一点（只取 anchor 之后的兄弟）；若某组跨越了 anchor
+     * 之前的位置（题干在容器中间），它不会出现在 `rest` 里，天然被排除。
+     *
+     * @returns {Element[]} 清洗后的选项组；无则 []
+     */
+    _siblingsAfter(parent, anchor) {
+      if (!parent || !parent.children) return [];
+      const kids = Array.from(parent.children);
+      const ai = kids.indexOf(anchor);
+      if (ai < 0) return [];
+      // 只看 anchor 之后的兄弟（从 anchor 的下一个开始）—— 保证「题干之后」的位置约束
+      const rest = kids.slice(ai + 1);
+      const groups = new Map();
+      for (const el of rest) {
+        const gk = el.tagName + '\u0001' + (el.className || '');
+        if (!groups.has(gk)) groups.set(gk, []);
+        groups.get(gk).push(el);
+      }
+      let best = [];
+      let bestScore = -Infinity;
+      for (const g of groups.values()) {
+        if (g.length < 2) continue;
+        const cleaned = this._cleanGroup(g);
+        if (cleaned.length < 2) continue;
+        const texts = cleaned.map((el) => readText(this._textHost(el)));
+        const score = scoreOptionGroup(texts, 0);
+        if (score > bestScore) { best = cleaned; bestScore = score; }
+      }
+      return best;
+    },
+
+    /**
+     * 组清洗（方案 B/C/D 共用的统一过滤管线）—— 把一组候选元素过一遍所有否决规则，
+     * 返回可用的选项元素；不合格返回 []。集中一处避免三条通道各写一份、判据漂移。
+     *
+     * 规则（按顺序）：
+     *   1. 数量必须是 2~4；
+     *   2. 噪声黑名单（元素**自身** class，见 `inNoiseContainer` 的 P1① 说明）；
+     *   3. 成员文本非空、长度 ≤ 200、非单噪声 token；
+     *   4. 逐个摘除 NAV_WORDS 成员；
+     *   5. **摘完不足 2 → 回退为不摘**，但**页脚按钮组仍必须否决**（P1③：回退只针对
+     *      「摘完不足 2」，不豁免「全是按钮 + 全是操作词」——否则页脚 [上一题][下一题]
+     *      会被送去解题、真点「上一题」切页/交卷，比读空更糟）；
+     *   6. 整组命中「题目元信息」（`META_RE`：题型/分值/难度）→ 否决（round-23，防「单选题/2分」顶掉选项）；
+     *   7. 内容形状（全数字/全符号）否决；
+     *   8. 文本集合 size ≥ 2（排斥布局重复）。
+     *
+     * @param {Element[]} g 同父同 tag 同 class 的候选组
+     * @returns {Element[]} 去重后的可用选项；不合格 []
+     */
+    _cleanGroup(g) {
+      if (!g || !g.length) return [];
+      if (g.length < 2 || g.length > 4) return [];
+      // 噪声黑名单（只查自身 class）
+      for (const el of g) { if (inNoiseContainer(el)) return []; }
+      // 成员文本校验
+      for (const el of g) {
+        const t = readText(this._textHost(el));
+        if (!t || t.length > 200 || isSingleNoiseToken(t)) return [];
+      }
+      // 成员级摘除 NAV 词 + 回退
+      let kept = g.filter((el) => NAV_WORDS.indexOf(readText(this._textHost(el))) < 0);
+      let fellBack = false;
+      if (kept.length < 2) {
+        // 回退：不摘导航词（真题选项可能就叫「返回」）；但页脚按钮组仍必须否决（P1③）
+        const allBtn = g.every((el) => el.tagName === 'BUTTON'
+          || (el.getAttribute && el.getAttribute('role') === 'button'));
+        const allAct = g.every((el) => ACTION_WORDS.indexOf(readText(this._textHost(el))) >= 0);
+        if (allBtn && allAct) return [];
+        kept = g.slice();
+        fellBack = true;
+      }
+      const texts = kept.map((el) => readText(this._textHost(el)));
+      // 「剩余全操作词」否决**只在未回退时**生效：回退场景本就是「摘完不足 2」，
+      // 若再用这条否决，真题「返回/继续学习」（两词都 ∈ ACTION_WORDS）会被误杀
+      // （测 ⑯ 回归）。回退场景的页脚按钮防护已由上面的 `allBtn && allAct` 单独承担。
+      if (!fellBack && texts.every((t) => ACTION_WORDS.indexOf(t) >= 0)) return []; // 页脚按钮组
+      if (texts.every((t) => META_RE.test(t))) return [];              // 题目元信息标签组（题型/分值/难度）
+      if (looksLikeNoiseTexts(texts)) return [];                       // 全数字/全符号
+      if (new Set(texts).size < 2) return [];                          // 布局重复
+      return this._dedupeOptions(kept);
+    },
+
+    /**
+     * 独立读选项：返回 { elements, texts }，**不依赖 readCurrent().options 是否为空**。
+     *
+     * 为什么必须单独暴露这一个入口（P1 修复的核心）：
+     * 进入 `_tryNonStandardAB` 的条件是「readCurrent().options 为空」，而它内部第一段
+     * 真作答要求「选项 >= 2」——两者互斥，导致真作答成了永不执行的死代码。
+     * 根因在于把「标准选择器读不到选项」等同于「这题没有选项」。
+     * 事实上「按钮式 A/B 弹窗」（选项是 button / div，没有 .el-radio）标准选择器读不到，
+     * 但它**有选项**，完全应该能读题、能作答。
+     * 所以这里提供一条更宽的独立读取通道：标准选择器读不到时，再用宽口径选择器兜一层。
+     */
+    readOptions(root) {
+      const r = root || this.root();
+      if (!r || !r.querySelectorAll) return { elements: [], texts: [] };
+
+      // 第一优先：复用标准通道（含 .el-radio / .el-checkbox 的专属 + 兜底选择器）
+      let els = this._readOptionEls(r);
+
+      // ===== 方案优先级重排（round-22 收敛决策）=====
+      //   标准读 → 方案 D（题干锚定，最高优先，有位置先验）
+      //          → 方案 A（文本正则，有内容先验）
+      //          → 方案 B（结构对称，限定在 A 的候选内）
+      //          → 方案 C（全树猜测，最后兜底）
+      // 核心变化：**D 有结果（≥2）就直接返回，不再跑 A/B/C** —— 位置先验一旦成立，
+      // 它的结论比任何黑名单/打分都可靠，也让噪声只能靠位置被排除，不再靠碰运气。
+      if (els.length < 2) {
+        const scope = r.querySelector('div.el-dialog__body') || r;
+        const titleEl = this._findTitleEl(r);
+        const anchored = this._anchoredOptions(scope, titleEl);
+        if (anchored.length >= 2) {
+          return {
+            elements: anchored,
+            texts: anchored.map((o) => readText(this._textHost(o))),
+          };
+        }
+      }
+
+      // 第二优先：宽口径兜底 —— 覆盖「按钮式 / div 式」的 A/B 题。
+      // 限定在 body 内，避免把页脚按钮也当成选项。
+      if (els.length < 2) {
+        const WIDE = 'button, .btn, [role="button"], .option, .option-item, .choice,'
+          + ' .choice-item, .answer-option, .topic-item, .item-topic, .el-radio, .el-checkbox, label, li';
+        const scope = r.querySelector('div.el-dialog__body') || r;
+        const candidates = Array.from(scope.querySelectorAll(WIDE));
+
+        // 通道 ①：文本前缀匹配（方案 A）。
+        // 必须同时排掉操作词（关闭/提交/上一题/下一题…）：文本通道同样会捞到页脚按钮，
+        // 若只按正则过滤，「下一题」这类不带 A/B 前缀的虽不中，但「关闭」等若变形也可能漏网。
+        const byText = candidates.filter((el) => {
+          const t = readText(this._textHost(el));
+          return OPTION_TEXT_RE.test(t) && ACTION_WORDS.indexOf(t) < 0;
+        });
+        let picked = this._dedupeOptions(byText);
+
+        // 通道 ②：结构对称白名单（方案 B）—— 兜「选项一/选项二」这类无 A/B 关键字、
+        // 也无「对/错」关键字的长句选项。
+        // 为什么这条判据可靠：A/B 二选一弹窗的选项天然同父、同标签、同 class，
+        // 且数量恰好 2（或 2~4 个多选）；而弹窗里的页脚按钮/正文段落不具备这种对称性。
+        // 只在文本通道颗粒无收时才启用，避免与通道 ① 打架。
+        if (picked.length < 2) {
+          const sym = this._symmetricOptions(candidates);
+          if (sym.length >= 2) picked = sym;
+        }
+
+        // 通道 ③：结构对称**自动发现**（方案 C）—— 不依赖 class 白名单，最后兜底。
+        // ①② 都建立在 `candidates`（WIDE 选择器产物）之上，而自定义 class 的
+        // div/span/p 选项 WIDE 命中为 0 → ①② 同时空转。此通道直接从 scope 子树
+        // 按「同父 + 同 tag + 数量 2~4」自动发现选项组，补上这块盲区。
+        // 注意：方案 C 仅作**最后兜底**，单独存进 `auto`，不与 A/B 混为一谈。
+        let auto = [];
+        if (picked.length < 2) {
+          auto = this._autoSiblings(scope);
+        }
+
+        // 合并规则：D 已在上面优先返回；这里再判 C（兜底）与 A/B（正向判据优先）。
+        if (picked.length < 2 && auto.length >= 2) els = auto;
+        else if (picked.length > els.length) els = picked;
+      }
+
+      return {
+        elements: els,
+        texts: els.map((o) => readText(this._textHost(o))),
+      };
+    },
+
+    /**
+     * 结构对称选项识别（方案 B）。
+     *
+     * 判据：同一父节点下、同 tagName、同 className 的一组元素，数量在 [2,4] 之间。
+     * 这组元素在 A/B 弹窗里就是选项列表；在普通弹窗里（页脚按钮一两个、
+     * 正文段落各不相同）很难同时满足「同父 + 同标签 + 同 class + 数量 2~4」。
+     *
+     * 额外收紧：候选文本必须非空，且不能是"关闭/确定/提交/取消"这类操作词
+     * （页脚常见两个同款 button，正好也是同父同标签同 class——不排除会误当成选项）。
+     */
+    _symmetricOptions(candidates) {
+      const groups = new Map();
+      for (const el of candidates) {
+        const p = el.parentElement;
+        if (!p) continue;
+        const t = readText(this._textHost(el));
+        if (!t) continue;
+        // 用父节点**身份**（WeakMap 全局唯一序号）分组，而不是 `indexOf(p)`：
+        // 后者是「父在其父中的下标」，两个无关容器各为其父第 0 子时会串成一族（P1）。
+        const gk = parentIdOf(p) + '|' + el.tagName + '\u0001' + (el.className || '');
+        if (!groups.has(gk)) groups.set(gk, []);
+        groups.get(gk).push(el);
+      }
+      let best = [];
+      for (const g of groups.values()) {
+        // 统一过滤管线（含噪声黑名单、NAV 摘除 + 回退、页脚按钮组否决、形状否决）
+        const cleaned = this._cleanGroup(g);
+        if (cleaned.length >= 2 && cleaned.length > best.length) best = cleaned;
+      }
+      return best;
+    },
+
+    /**
+     * 结构对称**自动发现**（方案 C）—— 不依赖任何 class 白名单。
+     *
+     * 为什么必须再加这一条通道（round-20 真 P1）：
+     * 方案 A（文本正则）与方案 B（`_symmetricOptions`）**共用同一个 `candidates`**，
+     * 而 `candidates` 由 `WIDE` 选择器（`button/.btn/.option/.choice-item/label/li…`）产出。
+     * 实测：只要选项是「纯 div / span / p + 自定义 class」（如 `.opt-item`、`.answer-item`、
+     * `.xx-option`、裸 `<p>甲</p><p>乙</p>`），`WIDE` 命中 **0** → 两条通道同时空转 → 读不到选项
+     * → `solve=0` → 又只乱猜。这正是用户报障「有的题目你没答」的真实成因。
+     *
+     * 判据：在 scope 子树内，找「同一父节点 + 同 tagName + 同 className + 子元素数量 2~4」的兄弟组；
+     * 每组再过滤：父节点**不含直接文本节点**（排除题干/标题容器）、
+     * 每个子元素文本非空、文本长度 ≤ 200（排除整段题干）、
+     * **逐个摘除操作词成员**（关闭/提交/上一题/下一题…）后剩余 ≥2、
+     * 剩余文本集合 size ≥ 2（排斥布局重复）、
+     * 且子元素内**不含嵌套块级元素**（`div/section/article/ul/table/dl`，排斥题干容器）。
+     *
+     * **正向判据（round-21 新增，专治「分页器顶掉真选项」）**：
+     *   ① 噪声容器黑名单 `inNoiseContainer`（分页器/步骤条/选项卡/面包屑/控制条…）→ 整组弃用；
+     *   ② 内容形状 `looksLikeNoiseTexts`（全数字=分页器 / 全符号=图标组）→ 整组弃用；
+     *   ③ **打分制** `scoreOptionGroup`：按「像不像答案」打分（2 项 >3 项 >4 项，A./B. 前缀加分，
+     *      文本像人话加分，深度 tie-break），取代旧的「谁长谁赢」——后者等于「噪声必胜」。
+     *
+     * 性能：只对 `scope` 子树按 `children` 分组做**一趟**遍历（O(节点数)），不做全树两两比较；
+     * 深度上限 `AUTO_MAX_DEPTH` 层，避免超深 DOM 拖慢主循环（触顶会打一条一次性告警）。
+     *
+     * @returns {Element[]} 综合评分最高的一组元素；无则 []
+     */
+    _autoSiblings(scope) {
+      if (!scope || !scope.querySelectorAll) return [];
+      const BLOCK = { DIV: 1, SECTION: 1, ARTICLE: 1, UL: 1, OL: 1, TABLE: 1, DL: 1, FORM: 1 };
+      const nodes = [scope];
+      let overDepth = 0; // 触顶被跳过的节点数（用于一次性告警）
+      try {
+        for (const el of scope.querySelectorAll('*')) {
+          let d = 0;
+          let p = el.parentElement;
+          while (p && p !== scope) { d++; p = p.parentElement; if (d > AUTO_MAX_DEPTH) break; }
+          if (d <= AUTO_MAX_DEPTH) nodes.push(el);
+          else overDepth++;
+        }
+      } catch (e) { /* 某些环境选择器异常 → 退化为只用 scope */ }
+
+      // 深度触顶告警（只打一次）：选项埋得比 AUTO_MAX_DEPTH 还深时方案 C 会静默失效，
+      // 留一条日志便于线上排查「某些弹窗读不到选项」是否因深度不够。
+      if (overDepth > 0 && !_depthWarned && ZHS.Log && ZHS.Log.warn) {
+        _depthWarned = true;
+        ZHS.Log.warn('方案C 遍历触顶：有 ' + overDepth + ' 个节点深度 > ' + AUTO_MAX_DEPTH
+          + '，已跳过；若某些弹窗读不到选项，可上调 AUTO_MAX_DEPTH');
+      }
+
+      let best = [];
+      let bestScore = -Infinity; // 打分制：分高者胜（取代旧「谁长谁赢」）
+      for (const parent of nodes) {
+        // 以 parent 为「同一父节点」，按其 children 的「tagName + className」分组。
+        // 用 class 一起分组（而非只按 tag）是为了处理「选项与题干容器平级」的布局：
+        // 如 `<div class="q-title">题干</div><div class="xx-option">甲</div><div class="xx-option">乙</div>`
+        // —— 若只按 tag=DIV 分组，q-title 会混进来凑成 3 个不同 class 的元素组被整体否掉；
+        // 按 tag+class 分组后，两个 .xx-option 自成一组（数量 2、class 一致）→ 正确识别。
+        const byKey = new Map();
+        for (const ch of parent.children) {
+          const key = ch.tagName + '\u0001' + (ch.className || '');
+          if (!byKey.has(key)) byKey.set(key, []);
+          byKey.get(key).push(ch);
+        }
+        for (const [, group] of byKey) {
+          if (group.length < 2 || group.length > 4) continue;
+          // 父节点自身含「直接文本」（非空白文本节点）→ 是题干/标题容器，不是选项列表容器。
+          // 为什么需要：负例④「以下哪项不是 <span>TCP</span> <span>UDP</span> <span>HTTP</span> 的特点？」
+          // 里 `.kw` 三个 span 同父同标签数量 3，会盖过真正的 2 个选项；而它们的父节点
+          // 夹着大段直接文本，正是题干特征。真正的选项列表容器只包着选项，几乎没有裸文本。
+          let hasDirectText = false;
+          for (const node of parent.childNodes) {
+            if (node.nodeType === 3 && node.nodeValue && node.nodeValue.trim()) { hasDirectText = true; break; }
+          }
+          if (hasDirectText) continue;
+          // 子元素不得内含嵌套块级元素（题干容器典型特征）
+          let blocked = false;
+          for (const el of group) {
+            for (const cc of el.children) { if (BLOCK[cc.tagName]) { blocked = true; break; } }
+            if (blocked) break;
+          }
+          if (blocked) continue;
+          // 统一过滤管线（含噪声黑名单、NAV 摘除 + 回退、页脚按钮组否决、形状否决）
+          const cleaned = this._cleanGroup(group);
+          if (cleaned.length < 2) continue;
+          const texts = cleaned.map((el) => readText(this._textHost(el)));
+          // 计算该组深度（以 scope 为基准）—— 仅作入参保留，打分函数已不使用（见 scoreOptionGroup 说明）
+          let depth = 0;
+          let pp = parent;
+          while (pp && pp !== scope) { depth++; pp = pp.parentElement; }
+          // 打分制：取代旧的「谁长谁赢」——按「像不像答案」打分，分高者胜。
+          const score = scoreOptionGroup(texts, depth);
+          if (score > bestScore) { best = cleaned; bestScore = score; }
+        }
+      }
+      return best;
+    },
+
+    /** 读取当前分页的完整题目（切页后调用） */
+    readCurrent(root) {
+      const r = root || this.root();
+      if (!r) return null;
+      // 题干：优先 Element UI 弹窗内的题面（.el-dialog__body 里），再退回标准弹题选择器。
+      // 说明：不用 `.el-dialog__title`——那是「弹窗标题」（如"课中答题"），
+      // 真正的题目文字在 body 里；标题只能作最后兜底线索，不能当题干送去求解。
+      const titleEl = r.querySelector(
+        '.el-dialog__body .question-topic, .el-dialog__body .topic-content,'
+        + ' .topic-title, .topic-content, .topic-question'
+      );
+      let title = readText(titleEl);
+      const { elements: optionEls, texts: options } = this.readOptions(r);
+
+      if (!title) {
+        const elTitle = r.querySelector && r.querySelector('.el-dialog__title');
+        if (elTitle) {
+          const t = readText(elTitle);
+          // 过滤掉 Element UI 自带的「标题 + 关闭按钮」按钮文字（如 "课中答题" 本身是有用线索，保留）
+          if (t) title = t;
+        }
+      }
+
+      // 真机兜底（docs/04）：知到「AI助教小智」弹题的题干只是正文里一段普通 <p>，
+      // 没有 .topic-title 特征类；上面会退化成拿弹窗标题「弹题测验」当题干，
+      // 求解器等于没有题干 → 整题判无答案。这里从正文挑最像题干的一段补上。
+      if (!title || title.length < 4 || /^(弹题测验|课中答题|答题|弹题)$/.test(title)) {
+        const stem = extractDialogStem(r);
+        if (stem) title = stem;
+      }
+
+      let typeText = readText(r.querySelector('.topic-type, .subject_type'));
+      // 真机题型标注嵌在正文段落（如「正确【单选题】」），不在 .topic-type 里
+      if (!typeText) {
+        const whole = readText(r);
+        if (/多选题|多选/.test(whole)) typeText = '多选题';
+        else if (/判断题|判断/.test(whole)) typeText = '判断题';
+        else if (/单选题|单选/.test(whole)) typeText = '单选题';
+      }
+      return {
+        title,
+        options,
+        type: guessType(typeText + ' ' + title, options),
+        elementList: optionEls,
+        node: r,   // 供 Filler.fill 在弹题容器内定位输入框，避免填空题退化到整页 document
+      };
+    },
+
+    /**
+     * 按「Element UI 专属优先、标准结构兜底」的次序读选项元素。
+     * 主选择器专属 .el-dialog__body 范围内，避免把弹窗页脚的空 div 之类当选项；
+     * 一旦主选择器有结果就不再叠加兜底选择器（叠加会重新引入 [A,B,A,B] 重影）。
+     */
+    _readOptionEls(r) {
+      // 用 `div.el-dialog__body` 而不是裸 `.el-dialog__body`：测试环境里
+      // `#playTopic-dialog` 这类纯 div 容器也被 present()/祖先判定视为 Element UI 弹窗，
+      // 需要排除，否则标准弹题的选项会被主选择器误命中。真实 Element UI 的 body 就是 div。
+      const main = Array.from(
+        r.querySelectorAll('div.el-dialog__body .el-radio, div.el-dialog__body .el-checkbox')
+      );
+      if (main.length) return this._dedupeOptions(main);
+      const FALLBACK = 'ul .topic-item, .topic .radio ul > li, .answerOption label,'
+        + ' .radio > label, .checkbox > label, .el-radio, .el-checkbox';
+      return this._dedupeOptions(Array.from(r.querySelectorAll(FALLBACK)));
+    },
+
+    /** 关闭弹题 */
+    close() {
+      const r = this.root();
+      if (!r) return false;
+
+      // 拟人点击：真机反作弊会看 isTrusted=false / 零位移合成事件。
+      const clickHuman = (el) => {
+        try {
+          if (U.realClickHuman) { U.realClickHuman(el); return true; }
+        } catch (e) { /* 回退普通点击 */ }
+        try { el.click(); return true; } catch (e) { return false; }
+      };
+
+      // 按优先级找关闭按钮（智慧树弹题的关闭控件在多个位置出现过）
+      // round-39：补 AI 助教弹窗关闭控件（ocsjs 原厂：.ai-test-question-wrapper 用 .close-box；
+      // .ai-class-exercise-dialog 用 .header-icon）——旧列表里没有，导致 AI 弹窗关不掉。
+      const CANDIDATES = [
+        '.close-btn',
+        '.close-box',
+        '.header-icon',
+        '.ai-class-exercise-dialog .el-dialog__close',
+        '.ai-test-question-wrapper .el-dialog__close',
+        '.el-dialog__close',
+        '.close',
+        '.topic-close',
+        '.popbtn_cancel',
+        'button[class*="close"]',
+        '.btn-cancel',
+      ];
+
+      for (const sel of CANDIDATES) {
+        let btn = null;
+        try { btn = r.querySelector ? r.querySelector(sel) : null; } catch (e) { /* 越界忽略 */ }
+        // 【P2 修复 · round-19】去掉全局兜底 `document.querySelector(sel)`。
+        //
+        // 原意是应对「root 是 document（iframe 场景）」——但那种情况下 r 本身就是 document，
+        // 上面的 `r.querySelector(sel)` 已经在 document 上查过了，根本不需要这一步。
+        // 而在正常页面里这行会**越界**：弹窗内没有 `.el-dialog__close` 时，
+        // 它会去全局找，点到**另一个弹窗/页面**上的同名关闭控件（实测被误点 1 次）。
+        // 现在只在「root 是 document」时允许查 document（语义等价于原意，不再越界）；
+        // 非 document 的 root 额外允许在它所属的 `.el-dialog__wrapper` 内查找——
+        // 因为关闭按钮有时挂在 wrapper 上而非 .el-dialog 内部，但仍限定在同一弹窗范围内。
+        if (!btn && r === document) {
+          try { btn = document.querySelector(sel); } catch (e) { /* 忽略 */ }
+        }
+        if (!btn && r !== document && r.closest) {
+          const wrapper = r.closest('.el-dialog__wrapper');
+          if (wrapper && wrapper !== r) {
+            try { btn = wrapper.querySelector(sel); } catch (e) { /* 忽略 */ }
+          }
+        }
+        if (btn) {
+          try {
+            clickHuman(btn);
+            ZHS.Log.info('已点击关闭按钮：' + sel);
+            return true;
+          } catch (e) {
+            ZHS.Log.debug('关闭按钮点击异常：' + e.message);
+          }
+        }
+      }
+
+      // 兜底 1：从弹题容器往上找「关闭/确定/提交/我知道了」文本按钮
+      //
+      // 【2026-09-19 修正】两点：
+      //  ① 文本读取改用 U.normText(el.innerText ?? el.textContent)：jsdom 里
+      //     `innerText` 恒为 undefined，旧写法 `el.innerText || el.textContent || ''` 中的
+      //     排序分支 `(a.innerText || '').length` 会把所有候选都算成长度 0 →
+      //     排序随机化 → 可能点到「正文里的空 div」而不是真正的关闭按钮。
+      //  ② 只接受**文本非空**的元素：空文本的 div 只是布局容器，点它没有任何意义。
+      //  ③ 必须优先真正的可点控件（button/a），并把「包住该控件的容器」剔除。
+      //     实测事故：`.el-dialog__footer`（DIV）与它内部的 `<button>关闭</button>` 文本都是"关闭"，
+      //     旧代码按文本长度排序时两者并列（都是 2），DIV 排在前面被选中 →
+      //     点击落在**容器**上（不冒泡到按钮的 click 处理器）→ 弹窗关不掉。
+      const textOf = (el) => U.normText(
+        el.innerText !== undefined && el.innerText !== null ? el.innerText : el.textContent
+      );
+      const scope = (r.querySelectorAll ? r : document);
+      const CLOSE_WORDS = ['关闭', '确定', '提交', '我知道了', '知道了', '继续学习'];
+      let btns = Array.from(scope.querySelectorAll('button, a, span, div'))
+        .filter((el) => CLOSE_WORDS.indexOf(textOf(el)) >= 0);
+
+      // 优先取真控件（button/a）；没有时再退化到 span/div
+      const interactive = btns.filter((el) => {
+        const tag = el.tagName;
+        return tag === 'BUTTON' || tag === 'A';
+      });
+      if (interactive.length) {
+        // 候选中若某个元素「包含了另一个候选」，说明它是外层容器，剔除（避免点到容器）
+        const innermost = interactive.filter(
+          (el) => !interactive.some((o) => o !== el && el.contains(o))
+        );
+        btns = innermost.length ? innermost : interactive;
+      } else {
+        // 只有 span/div 时同样剔除「包住其他候选」的外层容器
+        const innermost = btns.filter((el) => !btns.some((o) => o !== el && el.contains(o)));
+        if (innermost.length) btns = innermost;
+      }
+
+      if (btns.length) {
+        // 文本最短的优先（最贴近按钮本体，避免点到包住按钮的外层容器）
+        btns.sort((a, b) => textOf(a).length - textOf(b).length);
+        try {
+          clickHuman(btns[0]);
+          ZHS.Log.info('已点击文本关闭按钮：' + textOf(btns[0])
+            + '（' + btns[0].tagName + '）');
+          return true;
+        } catch (e) { /* 继续兜底 */ }
+      }
+
+      // 兜底 2：Esc
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', keyCode: 27, bubbles: true }));
+      ZHS.Log.debug('未找到关闭按钮，已派发 Esc');
+      return false;
+    },
+
+    /** 弹题是否仍存在 */
+    stillPresent() {
+      return this.present();
+    },
+  };
+
+  /**
+   * 场景 B：共享课作业页（.subject_node）
+   */
+  const HomeworkQuestions = {
+    present() {
+      return !!document.querySelector('.subject_node, .question-topic');
+    },
+
+    /** 采集所有题目 */
+    collect() {
+      const nodes = Array.from(document.querySelectorAll('.subject_node'));
+      if (!nodes.length) {
+        // 兜底：.question-topic 直接作为题目
+        const topics = Array.from(document.querySelectorAll('.question-topic'));
+        return topics.map((t, i) => this._fromTopic(t, i));
+      }
+      return nodes.map((n, i) => this._fromNode(n, i));
+    },
+
+    _fromNode(node, index) {
+      hydrateImages(node);
+
+      const titleEl = node.querySelector('.question-topic, .subject_title, .topic-title');
+      let title = readText(titleEl);
+      // 图片在题干里但无文字 → 标记需要 OCR
+      const needOcr = !title && hasImage(node);
+
+      const typeText = readText(node.querySelector('.subject_type, .question-type'));
+
+      const optionEls = Array.from(node.querySelectorAll('.nodeLab, .label.clearfix, label'));
+      const options = optionEls.map((o) => {
+        const txt = readText(o);
+        // 去掉开头的 "A. " 之类前缀（保留原始，回填需要）
+        return txt;
+      });
+
+      return {
+        title,
+        options,
+        type: guessType(typeText, options),
+        index,
+        needOcr,
+        elementList: optionEls,
+        node,
+        raw: readText(node).slice(0, 500),
+      };
+    },
+
+    _fromTopic(topicEl, index) {
+      hydrateImages(topicEl);
+      const node = topicEl.closest('.subject_node') || topicEl.parentElement;
+      const title = readText(topicEl);
+      const optionEls = node ? Array.from(node.querySelectorAll('label, .nodeLab')) : [];
+      const options = optionEls.map((o) => readText(o));
+      return {
+        title,
+        options,
+        type: guessType(title, options),
+        index,
+        needOcr: false,
+        elementList: optionEls,
+        node,
+        raw: title,
+      };
+    },
+
+    /** 下一题按钮 */
+    nextButton() {
+      return document.querySelector('.next-topic.next-t, .next-topic');
+    },
+  };
+
+  /**
+   * 场景 C：hike 作业/考试（.q_main）
+   */
+  const HikeQuestions = {
+    present() {
+      return !!document.querySelector('.q_main, .question-topic');
+    },
+
+    collect() {
+      const root = document.querySelector('.q_main') || document;
+      const nodes = Array.from(root.querySelectorAll('.question-topic, .question-item'));
+      return nodes.map((n, i) => {
+        const container = n.closest('.question-item, .q_item, .question') || n.parentElement;
+        hydrateImages(n);
+        const title = readText(n);
+        const typeText = container ? ((container.querySelector('.question_score, .question-type') || {}).textContent || '') : '';
+        const optionEls = container ? Array.from(container.querySelectorAll('label')) : [];
+        const options = optionEls.map((o) => readText(o));
+        return {
+          title,
+          options,
+          type: guessType(typeText + ' ' + title, options),
+          index: i,
+          needOcr: false,
+          elementList: optionEls,
+          node: container,
+          raw: title,
+        };
+      });
+    },
+  };
+
+  const Questions = {
+    TYPE,
+    BANK_TYPE,
+    guessType,
+    hydrateImages,
+    hasImage,
+    Dialog: DialogQuestions,
+    Homework: HomeworkQuestions,
+    Hike: HikeQuestions,
+
+    /** 自动判断当前是什么场景 */
+    scene() {
+      if (DialogQuestions.present()) return 'dialog';
+      if (/dohomework|doexamination/.test(location.href)) return 'homework';
+      if (/answer-homework|answer-exam/.test(location.href)) return 'hike';
+      if (HomeworkQuestions.present()) return 'homework';
+      if (HikeQuestions.present()) return 'hike';
+      return null;
+    },
+
+    /** 按场景采集 */
+    collect() {
+      const s = this.scene();
+      if (s === 'dialog') return DialogQuestions.collect();
+      if (s === 'homework') return HomeworkQuestions.collect();
+      if (s === 'hike') return HikeQuestions.collect();
+      return [];
+    },
+  };
+
+  ZHS.Questions = Questions;
+})();
+
+/* ===== 09-bank.js ===== */
+/**
+ * 网络层：题库 API 客户端
+ *
+ * 对接 TikuAdapter 标准协议：
+ *   POST {bankUrl}/adapter-service/search
+ *   body: { question, options[], type }   type: 0单选 1多选 2填空 3判断 4问答
+ *   resp: { code, data: { answers: [...], from } }
+ *
+ * 油猴环境用 GM_xmlhttpRequest 绕 CORS；无 GM 时降级 fetch。
+ */
+(function () {
+  'use strict';
+  const ZHS = window.ZHS;
+  if (!ZHS || !ZHS.Util) return;
+  // 重入守卫：SPA 二次注入时整个模块直接退出，避免定时器/监听器叠加
+  if (ZHS.__mod09_bank) return;
+  ZHS.__mod09_bank = true;
+  const U = ZHS.Util;
+
+  const hasGMXhr = typeof GM_xmlhttpRequest === 'function';
+
+  /**
+   * 同类故障 30 秒内只报一次。
+   *
+   * 为什么必须节流：服务商挂掉时主循环每 2 秒一轮，一道错题就刷一条，
+   * 几十轮下来控制台全被同一句话淹没，反而看不到其它更有用的信息。
+   * 另外日志本身绝不允许反过来炸主流程，故 fn 外层套 try。
+   */
+  const _diagAt = Object.create(null);
+  function _throttled(key, fn) {
+    const now = Date.now();
+    if (_diagAt[key] && now - _diagAt[key] < 30000) return;
+    _diagAt[key] = now;
+    try { fn(); } catch (e) { /* 日志失败不得冒泡 */ }
+  }
+
+  /**
+   * 失败类型枚举。
+   *
+   * 【2026-09-19 第⑤层修复】旧实现把所有失败压成 `{ok:false, status:0}`，
+   * 于是「网络不通」「请求超时」「服务商返回 HTML 错误页」「余额不足」
+   * 这四种完全不同的故障，在用户面板上都显示同一句「请求失败」——
+   * 用户既不知道该改什么，也无从自查。
+   * 现在按成因分类，调用方据此生成可操作的中文提示。
+   */
+  const FAIL = {
+    OK: 'ok',
+    TIMEOUT: 'timeout',       // 到点没回来（网络慢 / 服务卡死）
+    NETWORK: 'network',       // 根本没发出去（跨域被拦 / DNS / 断网 / localhost 没起）
+    HTTP: 'http',             // 服务端明确回了非 2xx
+    EMPTY: 'empty',           // 2xx 但响应体是空的
+    NON_JSON: 'non-json',     // 2xx 但不是 JSON（多半是 HTML 错误页 / 门户页）
+  };
+
+  /** 统一请求（返回 Promise<{ok, status, text, kind, detail}>）
+   *
+   * 新增字段全部可选，旧调用方只读 {ok,status,text} 不受影响。
+   */
+  function request(opts) {
+    const { url, method = 'GET', headers = {}, data = null, timeout = 15000 } = opts;
+
+    if (hasGMXhr) {
+      return new Promise((resolve) => {
+        let settled = false;
+        const done = (r) => { if (!settled) { settled = true; resolve(r); } };
+        try {
+          GM_xmlhttpRequest({
+            url,
+            method,
+            headers,
+            data,
+            timeout,
+            onload: (res) => done({
+              ok: res.status >= 200 && res.status < 300,
+              status: res.status,
+              text: res.responseText,
+              kind: res.status >= 200 && res.status < 300 ? FAIL.OK : FAIL.HTTP,
+              detail: '',
+            }),
+            // 超时与网络错误过去都返回 status=0，调用方完全无法区分，
+            // 现在拆成两类：超时多半要调大超时时间，网络错误多半要检查地址/跨域。
+            ontimeout: () => done({
+              ok: false, status: 0, text: '',
+              kind: FAIL.TIMEOUT,
+              detail: '请求超过 ' + timeout + 'ms 未返回',
+            }),
+            onerror: () => done({
+              ok: false, status: 0, text: '',
+              kind: FAIL.NETWORK,
+              detail: '连接未建立（跨域被拦截 / 地址不可达 / 服务未启动）',
+            }),
+          });
+        } catch (e) {
+          done({
+            ok: false, status: 0, text: '',
+            kind: FAIL.NETWORK,
+            detail: '发起失败：' + e.message,
+          });
+        }
+      });
+    }
+
+    // 降级 fetch
+    return new Promise((resolve) => {
+      const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+      let timedOut = false;
+      const timer = setTimeout(() => { timedOut = true; if (ctrl) ctrl.abort(); }, timeout);
+      fetch(url, { method, headers, body: data, signal: ctrl ? ctrl.signal : undefined })
+        .then((r) => r.text().then((text) => ({
+          ok: r.ok, status: r.status, text,
+          kind: r.ok ? FAIL.OK : FAIL.HTTP,
+          detail: '',
+        })))
+        .then((r) => { clearTimeout(timer); resolve(r); })
+        .catch((e) => {
+          clearTimeout(timer);
+          // AbortError 只可能是我们自己的超时定时器触发的，据此拆出 TIMEOUT
+          const kind = timedOut ? FAIL.TIMEOUT : FAIL.NETWORK;
+          resolve({
+            ok: false, status: 0, text: '',
+            kind,
+            detail: timedOut ? '请求超过 ' + timeout + 'ms 未返回' : ('发起失败：' + e.message),
+          });
+        });
+    });
+  }
+
+  /**
+   * 从 HTML 片段里抠出 <title>，用于让用户知道"到底是谁返回了这一页"。
+   * 抠不到就返回空串，不抛异常。
+   */
+  function extractHtmlTitle(text) {
+    const m = String(text || '').match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+    return m ? m[1].trim().replace(/\s+/g, ' ').slice(0, 80) : '';
+  }
+
+  /**
+   * ★ 响应体诊断：把「一次失败的 HTTP 调用」翻译成人能看懂的中文 + 可操作建议。
+   *
+   * 这是本次修复的核心。过去 provider 返回网关 502 页 / 代理拦截页 / 门户首页时，
+   * 下游 JSON.parse 只会抛一句「返回非 JSON」，用户无从判断是 Key 错、地址错还是网络错，
+   * 只能反复重试——正是幻觉税（arxiv 2509.14583 所述约 40% 算力被这类无效重试吃掉）的现实版本。
+   *
+   * @param {string} label  调用点名称，如 '大模型' / '题库'
+   * @param {object} res    request() 的返回值
+   * @param {string} url    请求地址（用于生成建议）
+   * @returns {{code:string, msg:string, hint:string}}
+   */
+  function diagnose(label, res, url) {
+    const r = res || {};
+    const text = String(r.text || '');
+    const host = (function () {
+      try { return new URL(url).host; } catch (e) { return String(url || '').slice(0, 40); }
+    }());
+    // HTML 判据：以 '<' 开头，或前 200 字符里出现 <!DOCTYPE / <html
+    const head = text.slice(0, 200).toLowerCase();
+    const looksHtml = /^\s*</.test(text) || head.includes('<!doctype') || head.includes('<html');
+
+    switch (r.kind) {
+      case FAIL.TIMEOUT:
+        return {
+          code: 'TIMEOUT',
+          msg: label + '请求超时（' + host + ' 未在限定时间内响应）',
+          hint: '多半是网络慢或对方服务繁忙。可在设置里调大超时时间后重试；若持续超时，换一个可用的 API 地址。',
+        };
+      case FAIL.NETWORK:
+        return {
+          code: 'NETWORK',
+          msg: label + '连不上（' + host + '）' + (r.detail ? '：' + r.detail : ''),
+          hint: '检查：① 网络是否正常；② 地址是否写对（本地题库要先把 TikuAdapter 跑起来）；③ 油猴是否已授权跨域。',
+        };
+      case FAIL.HTTP: {
+        const s = Number(r.status);
+        let hint = '对方返回了 HTTP ' + s + '。';
+        if (s === 401 || s === 403) hint += '多半是 API Key 无效、过期或没权限——请在设置里重新填写并检查有无多余空格。';
+        else if (s === 402) hint += '账户余额不足，请先充值。';
+        else if (s === 404) hint += '接口路径不存在——请检查 API 地址是否少了 /v1 之类的前缀。';
+        else if (s === 429) hint += '请求过于频繁被限流，稍等片刻会自动重试。';
+        else if (s >= 500) hint += '对方服务器内部错误，属于服务端故障，稍后重试通常能恢复。';
+        // 非 2xx 且响应体是 HTML：说明根本没打到 API，被网关/代理/门户页截胡了
+        if (looksHtml) {
+          const title = extractHtmlTitle(text);
+          return {
+            code: 'HTTP_HTML',
+            msg: label + '返回了 HTML 页面而不是数据（HTTP ' + s + (title ? '，页面标题「' + title + '」' : '') + '）',
+            hint: '这通常说明请求被网关或代理页面拦下了，而不是打到了真正的 API 接口。'
+              + '请检查 API 地址是否填成了网站首页（应形如 https://api.deepseek.com，不要带 /chat/completions，脚本会自动拼接）。',
+          };
+        }
+        return { code: 'HTTP_' + s, msg: label + '请求被拒绝（HTTP ' + s + '）', hint };
+      }
+      case FAIL.OK:
+      default: {
+        if (!text.trim()) {
+          return {
+            code: 'EMPTY',
+            msg: label + '返回了空内容',
+            hint: '对方返回了 200 但响应体是空的，通常是服务端异常，稍后重试即可。',
+          };
+        }
+        if (looksHtml) {
+          const title = extractHtmlTitle(text);
+          return {
+            code: 'NON_JSON_HTML',
+            msg: label + '返回了 HTML 页面而不是 JSON 数据' + (title ? '（页面标题「' + title + '」）' : ''),
+            hint: '地址很可能填的是网站首页或被代理页拦下了，没打到真正的 API 接口。'
+              + '请改成形如 https://api.deepseek.com 的接口根地址（脚本会自动拼接 /chat/completions），不要填带页面 UI 的网址。',
+          };
+        }
+        return {
+          code: 'NON_JSON',
+          msg: label + '返回的不是合法 JSON',
+          hint: '把返回内容的前 100 字：' + text.slice(0, 100),
+        };
+      }
+    }
+  }
+
+  /** 判断是否解析成功；失败时抛带可操作信息的 Error */
+  function parseJsonOrThrow(label, res, url) {
+    const r = res || {};
+    if (!r.ok || !r.text) {
+      const d = diagnose(label, r, url);
+      const err = new Error(d.msg);
+      err.code = d.code;
+      err.hint = d.hint;
+      throw err;
+    }
+    try {
+      return JSON.parse(r.text);
+    } catch (e) {
+      const d = diagnose(label, r, url);
+      const err = new Error(d.msg);
+      err.code = d.code;
+      err.hint = d.hint;
+      throw err;
+    }
+  }
+
+  /**
+   * 答案归一化：把模型/题库的各种输出统一成标准形式
+   *  'B' / 'b' / 'B.' / '答案是A' → 'A'
+   *  'A,C' / 'ACD' / 'A、C' → 'A,C'
+   *  '对' / '正确' / 'True' → '对'
+   */
+  function normalize(raw) {
+    let s = String(raw == null ? '' : raw).trim();
+    if (!s) return '';
+
+    // 判断题
+    if (/^(对|正确|是|true|t|√|✓)$/i.test(s)) return '对';
+    if (/^(错|错误|否|false|f|×|✗)$/i.test(s)) return '错';
+    // 文本里含判定词（如"答案是：正确"）
+    if (/(正确|对)/.test(s) && !/[A-D]/.test(s) && s.length <= 6) return '对';
+    if (/(错误|错)/.test(s) && !/[A-D]/.test(s) && s.length <= 6) return '错';
+
+    // 提取所有 A-D 字母
+    const upper = s.toUpperCase();
+    const letters = upper.match(/[A-D]/g);
+    if (letters && letters.length) {
+      // 只有当去掉字母和分隔符后没别的内容，才认定是纯选项答案
+      const residue = upper.replace(/[\s,A-D、,，.。:：;；/|()（）[\]【】]/g, '');
+      if (residue === '' || residue.length <= 2) {
+        const uniq = Array.from(new Set(letters)).sort();
+        return uniq.join(',');
+      }
+      // 否则取最后一个字母（"答案是 B" 这类）
+      if (letters.length === 1) return letters[0];
+    }
+
+    return s;    // 填空题/简答：原文返回
+  }
+
+  /** 'B' → 1 ; 'A,C' → [0,2] */
+  function toIndexes(answer) {
+    if (!answer) return [];
+    const letters = String(answer).toUpperCase().match(/[A-D]/g);
+    if (!letters) return [];
+    return Array.from(new Set(letters)).map((l) => l.charCodeAt(0) - 65).sort((a, b) => a - b);
+  }
+
+  /** 答案列表 ['B'] → 'B' */
+  function pickBest(answers) {
+    if (!answers) return '';
+    const arr = Array.isArray(answers) ? answers : [answers];
+    const cleaned = arr.map((a) => normalize(a)).filter(Boolean);
+    if (!cleaned.length) return '';
+    // 取最长的那个（多选答案通常更长，更能命中）
+    cleaned.sort((a, b) => b.length - a.length);
+    return cleaned[0];
+  }
+
+  const Bank = {
+    normalize,
+    toIndexes,
+    pickBest,
+    request,
+    diagnose,
+    parseJsonOrThrow,
+    extractHtmlTitle,
+    FAIL,
+
+    /** 搜索答案，返回 {answer, from, raw} 或 null */
+    async search(question, options, type) {
+      const cfg = ZHS.config;
+      if (!cfg.bankEnabled) return null;
+      if (!question && (!options || !options.length)) return null;
+
+      // ★ 地址为空时不能照旧拼成 '/adapter-service/search' 发出去：
+      // 相对路径会打到当前网课站点上，拿到一串 HTML，下游却只报一句"返回非 JSON"，
+      // 用户完全看不出是「自己没填地址」。这里直接短路并给出明确指引。
+      const rawUrl = String(cfg.bankUrl || '').trim();
+      if (!rawUrl) {
+        _throttled('bank-empty', function () {
+          ZHS.Log.warn('题库未配置地址，已跳过查询。请在设置里填写题库地址（形如 http://127.0.0.1:8060）。');
+        });
+        return null;
+      }
+      const url = rawUrl.replace(/\/$/, '') + '/adapter-service/search';
+      const payload = {
+        question: String(question || '').slice(0, 500),
+        options: (options || []).slice(0, 10),
+        type: ZHS.Questions.BANK_TYPE[type] != null ? ZHS.Questions.BANK_TYPE[type] : 0,
+      };
+
+      const res = await request({
+        url,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        data: JSON.stringify(payload),
+        timeout: 12000,
+      });
+
+      if (!res.ok || !res.text) {
+        const d = diagnose('题库', res, url);
+        // 过去这条是 debug 级，用户看不见；失败原因必须进面板，否则"题库查不到"永远是黑盒。
+        _throttled('bank-' + d.code, function () {
+          ZHS.Log.warn(d.msg + '｜' + d.hint);
+        });
+        return null;
+      }
+
+      let json;
+      try { json = JSON.parse(res.text); } catch (e) {
+        const d = diagnose('题库', res, url);
+        _throttled('bank-' + d.code, function () {
+          ZHS.Log.warn(d.msg + '｜' + d.hint);
+        });
+        return null;
+      }
+
+      // 兼容多种返回结构
+      const data = json.data || json.result || json;
+      let answers = null;
+      let from = '';
+      if (data) {
+        answers = data.answers || data.answer || data.data;
+        from = data.from || data.source || '';
+        // 有的题库返回 [{answer: 'B'}]
+        if (Array.isArray(answers) && answers.length && typeof answers[0] === 'object') {
+          answers = answers.map((a) => a.answer || a.value || '').filter(Boolean);
+        }
+      }
+      if (!answers || (Array.isArray(answers) && !answers.length)) {
+        ZHS.Log.debug('题库未命中');
+        return null;
+      }
+
+      const answer = pickBest(answers);
+      if (!answer) return null;
+
+      ZHS.Log.info('题库命中：' + answer + (from ? '（来源 ' + from + '）' : ''));
+      return { answer, from, raw: answers };
+    },
+
+    /** 健康检查（布尔版，兼容旧语义） */
+    async ping() {
+      const cfg = ZHS.config;
+      const url = String(cfg.bankUrl || '').replace(/\/$/, '') + '/';
+      const res = await request({ url, method: 'GET', timeout: 5000 });
+      return res.ok;
+    },
+
+    /**
+     * 健康检查（结构化版，供面板「通道健康检测」展示）。
+     *
+     * 与 ping() 的区别：ping 只回一个 true/false，用户看到「异常」也不知道为什么；
+     * health() 复用 diagnose 返回成因 + 解决建议，与 LLM 通道的 test() 对齐。
+     */
+    async health() {
+      const cfg = ZHS.config;
+      const raw = String(cfg.bankUrl || '').trim();
+      if (!raw) {
+        return { ok: false, msg: '题库未配置地址', hint: '请在设置里填写形如 http://127.0.0.1:8060 的题库地址。', code: 'NO_URL' };
+      }
+      const url = raw.replace(/\/$/, '') + '/';
+      const res = await request({ url, method: 'GET', timeout: 5000 });
+      if (res.ok) return { ok: true, msg: '题库服务可达', hint: '', code: 'OK' };
+      const d = diagnose('题库', res, url);
+      return { ok: false, msg: d.msg, hint: d.hint, code: d.code };
+    },
+  };
+
+  ZHS.Bank = Bank;
+})();
+
+/* ===== 10-llm.js ===== */
+/**
+ * LLM 客户端：OpenAI 兼容接口 + 多次生成投票
+ *
+ * 默认 DeepSeek（https://api.deepseek.com），任何 OpenAI 兼容接口都能用。
+ */
+(function () {
+  'use strict';
+  const ZHS = window.ZHS;
+  if (!ZHS || !ZHS.Util) return;
+  // 重入守卫：SPA 二次注入时整个模块直接退出，避免定时器/监听器叠加
+  if (ZHS.__mod10_llm) return;
+  ZHS.__mod10_llm = true;
+  const U = ZHS.Util;
+
+  /**
+   * v0.6.64 重写答题 Prompt：逐步推理 + 排除法 + few-shot + 严格单Token输出。
+   *
+   * 设计目标（用户诉求「提高 LLM 选择正确性、永远不瞎选」）：
+   *   · 让模型「先想后答」——要求它依据知识点逐一判断选项对错、排除明显错误项，
+   *     再给最终答案。大量实验与本次生态调研都表明：模型被显式要求逐步推理时，
+   *     选择题正确率显著高于「直接给答案」。
+   *   · 但最终仍只输出答案本身——保 Bank.normalize 可解析（这是硬约束，
+   *     一旦模型输出大段分析，normalize 取不到字母就会整题作废）。
+   *     所以指令是「先在内心推理，再只输出答案」，思考与输出格式分离。
+   *   · few-shot 给一个「输入→输出」样板，进一步锚定输出格式，降低模型自由发挥。
+   *
+   * 反模式规避：不在 Prompt 里让它「解释为什么」，那会诱发长输出、破坏解析。
+   */
+  function buildPrompt(question, options, type) {
+    const optionText = (options && options.length)
+      ? '\n\n选项：\n' + options.map((o, i) => String.fromCharCode(65 + i) + '. ' + o).join('\n')
+      : '';
+
+    // 题型专属：label=题型名（进 Prompt，供识别与测试锚定），think=推理引导，out=输出硬格式，ex=few-shot 样板。
+    const rules = {
+      single: {
+        label: '单选题',
+        think: '先依据题目涉及的知识点，逐一分析每个选项的对错，排除明显错误或与题干无关的项，再在剩余项中确定唯一正确的答案。',
+        out: '最终只输出这一个选项的字母（如 B），严禁输出选项内容、分析过程或任何标点。',
+        ex: '例题——题目：下列哪一项是人体最大的器官？\n选项：\nA. 心脏\nB. 皮肤\nC. 肝脏\nD. 肺\n答案：B',
+      },
+      multiple: {
+        label: '多选题',
+        think: '逐一判断每个选项是否正确，把所有正确项全部选出（漏选和多选都扣分，拿不准的项要结合题干依据决定，不要全选）。',
+        out: '最终只输出所有正确选项的字母，用英文逗号分隔并按字母顺序排列（如 A,C），严禁输出选项内容或分析过程。',
+        ex: '例题——题目：以下哪些属于可再生能源？\n选项：\nA. 太阳能\nB. 煤炭\nC. 风能\nD. 石油\n答案：A,C',
+      },
+      judgement: {
+        label: '判断题',
+        think: '判断该陈述是否正确，特别注意题干里的绝对化用词（如"一定""所有""完全""唯一"）——这类表述往往是错误信号。',
+        out: '最终只输出"对"或"错"两个字之一，严禁输出其他任何内容。',
+        ex: '例题——题目：在标准大气压下，纯水的沸点是 100 摄氏度。\n答案：对',
+      },
+      completion: {
+        label: '填空题',
+        think: '根据题干与对应知识点，给出填空处最准确、最简洁的答案。',
+        out: '最终只输出填空的答案内容本身，不要输出完整句子或分析过程。',
+        ex: '',
+      },
+      qa: {
+        label: '简答题',
+        think: '根据题干简明扼要地作答，抓住核心要点，不必展开。',
+        out: '最终只输出简短的答案内容，不要输出分析过程。',
+        ex: '',
+      },
+      unknown: {
+        label: '',
+        think: '先判断题型（单选/多选/判断/填空），再按对应规则思考。',
+        out: '最终只输出答案：单选输出一个字母（如 B），多选输出逗号分隔字母（如 A,C），判断输出"对"或"错"。严禁输出分析过程。',
+        ex: '',
+      },
+    }[type] || {
+      label: '',
+      think: '仔细分析题目，依据相关知识点给出最准确的答案。',
+      out: '最终只输出答案本身，不要输出分析过程。',
+      ex: '',
+    };
+
+    const fewShot = rules.ex ? '\n\n' + rules.ex + '\n' : '';
+    const labelLine = rules.label ? '题型：' + rules.label + '\n' : '';
+
+    return `你是一位严谨的学科答题专家，请回答下面这道题。
+
+${labelLine}作答要求：
+1. ${rules.think}
+2. ${rules.out}${fewShot}
+请先在内心完成上述推理，然后严格按输出要求，只给出最终答案（不要带"答案"字样）。
+
+题目：
+${question}${optionText}
+
+最终答案：`;
+  }
+
+  /**
+   * v0.6.64：按题型给温度。选择题/判断题要「果断」，低温减少无谓的意见分裂
+   * （票型越集中，置信越高）；主观题保留一定创造性，用中温。
+   */
+  function tempFor(type) {
+    return (type === 'completion' || type === 'qa') ? 0.3 : 0.1;
+  }
+
+  // 单次 LLM 调用超时（毫秒）。
+  // 旧值 15 秒，慢模型 / 高峰期 / 长题干常答不完就超时失败 → 直接 fallback 到启发式或跳过，
+  // 表现为「明明配了 Key 还是答不对」。用户明确要求「给出足够时间 LLM 答题、不超时、不瞎蒙」，
+  // 这里调到 45 秒，覆盖绝大多数慢响应；再配合下方总预算闸门，仍不会无限拖死主循环。
+  const CALL_TIMEOUT_MS = 45000;
+  // 一道题的作答总预算（毫秒）。超时后放弃后续投票，用已有结果 or 直接认输。
+  // 调到 70 秒：允许单次 45s 超时被截断后仍有余量再试一次（共约 2 次调用），
+  // 既不轻易认输瞎蒙，也不像旧版 90s 那样把主循环彻底堵死。
+  const ANSWER_BUDGET_MS = 70000;
+
+  // 同类错误去重：投票最多 3 次，同一句诊断刷三遍纯属噪音，
+  // 只在「文案发生变化」时才再打一条。
+  const _llmDiagAt = Object.create(null);
+
+  /** 调用一次 LLM */
+  async function callOnce(question, options, type) {
+    const cfg = ZHS.config;
+    if (!cfg.llmKey) throw new Error('未配置 LLM API Key');
+
+    const base = String(cfg.llmBaseUrl || 'https://api.deepseek.com').replace(/\/$/, '');
+    const url = base + '/chat/completions';
+
+    // ★ 2026-09-19 新增：自动拼接前缀重复拦截。
+    // 脚本会自己拼 /chat/completions，用户若照着文档把完整调用地址也填进来，
+    // 拼出来就是 .../chat/completions/chat/completions → 必然 404。
+    // 过去这条表现为一句冰冷的「请求失败」，用户只会反复重试。这里直接自愈。
+    if (/\/chat\/completions$/i.test(base)) {
+      ZHS.Log.warn('API 地址不需要带 /chat/completions，脚本会自动拼接；已自动去掉重复后缀');
+    }
+    const cleanBase = base.replace(/\/chat\/completions$/i, '');
+    const finalUrl = cleanBase + '/chat/completions';
+    const payload = {
+      model: cfg.llmModel || 'deepseek-chat',
+      messages: [{ role: 'user', content: buildPrompt(question, options, type) }],
+      temperature: tempFor(type),
+      max_tokens: 200,
+    };
+
+    const res = await ZHS.Bank.request({
+      url: finalUrl,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: 'Bearer ' + cfg.llmKey,
+      },
+      data: JSON.stringify(payload),
+      timeout: CALL_TIMEOUT_MS,
+    });
+
+    // ★ 2026-09-19 核心修复（用户报「API 请求失败」的真根因）：
+    // 过去这里只有一句 `!res.ok → throw 'LLM 请求失败 status=..'`，
+    // 而当服务端（或网关/代理/门户页）返回 HTML 时，JSON.parse 只抛「LLM 返回非 JSON」——
+    // 用户看到的就是这四个字，既不知道是 Key 错、地址错还是网络错，只能反复重试。
+    // 现在交给网络层的 diagnose 分类，产出成因 + 可操作建议。
+    const json = ZHS.Bank.parseJsonOrThrow('大模型', res, finalUrl);
+
+    const content = json &&
+      json.choices && json.choices[0] &&
+      json.choices[0].message && json.choices[0].message.content;
+    if (!content) {
+      const err = new Error('大模型返回内容为空（模型可能不支持当前模型名，或返回被截断）');
+      err.code = 'EMPTY_CHOICES';
+      err.hint = '请检查设置里的模型名是否与服务商提供的完全一致（如 deepseek-chat / gpt-4o-mini）。';
+      throw err;
+    }
+    return String(content).trim();
+  }
+
+  // v0.6.64：最近一次投票的置信元数据（求解层读它做「低置信交叉验证 / 标注请人工检查」）。
+  // 为什么用模块属性而非改 vote() 返回值：vote() 的返回契约是「答案字符串」，
+  // 单测与多处调用方都依赖它（例如测试里 vote = async () => 'B' 的桩）；
+  // 改返回类型会破坏它们。故另开一个只读通道暴露置信。
+  const _lastMeta = { confidence: 'none', distribution: [], unanimous: false, n: 0, answer: '' };
+
+  /** 由票型算置信：全票一致=high；过半多数=medium；分裂无多数=low */
+  function _confidenceOf(entries, n) {
+    if (!entries.length) return 'none';
+    const top = entries[0][1];
+    if (entries.length === 1) return 'high';
+    if (top >= Math.ceil(n / 2)) return 'medium';
+    return 'low';
+  }
+
+  function _recordMeta(ans, entries, n) {
+    _lastMeta.answer = ans || '';
+    _lastMeta.distribution = entries.map((e) => ({ answer: e[0], votes: e[1] }));
+    _lastMeta.unanimous = entries.length === 1;
+    _lastMeta.n = n;
+    _lastMeta.confidence = _confidenceOf(entries, n);
+    return _lastMeta;
+  }
+
+  /**
+   * 多次生成投票取众数
+   * 提前收敛：某答案出现过半就返回
+   *
+   * v0.6.64：新增「置信追踪 + 分裂破平局」——
+   *   · 旧实现不看票型，1:1:1 三票分裂也照样返回最高票，等于把「没把握」当「有答案」。
+   *   · 现在：记录票型置信（high/medium/low）到 _lastMeta；分裂且还有预算时补投一次，
+   *     给模型又一次收敛机会，尽量把硬币翻转转成有依据的多数。
+   *   · 返回值仍是答案字符串（契约不变，测试桩可用）。
+   */
+  async function vote(question, options, type, times) {
+    const n = Math.max(1, Math.min(Number(times) || 3, 5));
+    const votes = {};
+    let lastErr = null;
+    // 总预算闸门：哪怕每次调用都没超时，3 次串起来也可能拖到 45 秒，
+    // 这段时间主循环是被 await 堵死的。到点就收工，用已有票或直接认输。
+    const deadline = Date.now() + ANSWER_BUDGET_MS;
+
+    const tally = (raw) => {
+      const ans = ZHS.Bank.normalize(raw);
+      if (!ans) return null;
+      votes[ans] = (votes[ans] || 0) + 1;
+      return ans;
+    };
+
+    for (let i = 0; i < n; i++) {
+      if (Date.now() >= deadline && i > 0) {
+        ZHS.Log.warn('LLM 作答超出总预算 ' + ANSWER_BUDGET_MS + 'ms，停止后续投票');
+        break;
+      }
+      try {
+        const raw = await callOnce(question, options, type);
+        const ans = tally(raw);
+        ZHS.Log.debug('LLM 第 ' + (i + 1) + ' 次输出：' + String(raw).slice(0, 40) + (ans ? ' → ' + ans : ''));
+
+        // 提前收敛：已过半
+        if (ans && votes[ans] >= Math.ceil(n / 2)) {
+          const entries = Object.entries(votes).sort((a, b) => b[1] - a[1]);
+          _recordMeta(ans, entries, n);
+          ZHS.Log.info('LLM 投票收敛于第 ' + (i + 1) + ' 次：' + ans
+            + '（置信 ' + _lastMeta.confidence + '）');
+          return ans;
+        }
+      } catch (e) {
+        lastErr = e;
+        // ★ 只打印 e.message 时，用户看到的是「大模型返回了 HTML 页面而不是 JSON 数据」，
+        // 但不知道该改哪里。hint 才是这份修复真正的产出，必须一起打出来。
+        // 同一类故障节流，避免 3 次投票把同一句刷三遍。
+        const key = 'llm-' + (e.code || 'err');
+        if (_llmDiagAt[key] !== e.message) {
+          _llmDiagAt[key] = e.message;
+          ZHS.Log.warn('大模型第 ' + (i + 1) + ' 次调用失败：' + e.message
+            + (e.hint ? '｜建议：' + e.hint : ''));
+        }
+      }
+      // 连续失败 2 次就放弃
+      if (i >= 1 && Object.keys(votes).length === 0 && lastErr) break;
+    }
+
+    let entries = Object.entries(votes);
+    if (!entries.length) {
+      _recordMeta('', [], n);
+      if (lastErr) throw lastErr;
+      return '';
+    }
+    entries.sort((a, b) => b[1] - a[1]);
+
+    // v0.6.64 破平局：票型分裂（无过半多数）且预算仍充裕 → 补投一次，再给一次收敛机会。
+    const topCount = entries[0][1];
+    if (topCount < Math.ceil(n / 2) && Date.now() < deadline - 4000) {
+      try {
+        ZHS.Log.info('LLM 投票分裂（' + entries.map((e) => e[0] + '×' + e[1]).join(' / ')
+          + '），补投一次尝试收敛');
+        const raw = await callOnce(question, options, type);
+        const ans = tally(raw);
+        if (ans) entries = Object.entries(votes).sort((a, b) => b[1] - a[1]);
+      } catch (e) {
+        lastErr = e;
+        const key = 'llm-tie-' + (e.code || 'err');
+        if (_llmDiagAt[key] !== e.message) {
+          _llmDiagAt[key] = e.message;
+          ZHS.Log.warn('破平局补投失败：' + e.message + (e.hint ? '｜建议：' + e.hint : ''));
+        }
+      }
+    }
+
+    const finalAns = entries[0][0];
+    const meta = _recordMeta(finalAns, entries, n);
+    ZHS.Log.info('LLM 投票结果：' + finalAns + '（' + entries[0][1] + '/' + n + ' 票，置信 '
+      + meta.confidence + (meta.unanimous ? '，全票一致' : '') + '）');
+    return finalAns;
+  }
+
+  const LLM = {
+    buildPrompt,
+    callOnce,
+    vote,
+    tempFor,
+    /** v0.6.64：读最近一次投票的置信元数据（求解层低置信交叉验证用） */
+    getLastVoteMeta() { return _lastMeta; },
+
+    /**
+     * round-44：主观题（填空/问答）单次生成——不投票。
+     *
+     * 为什么主观题不能走 vote：vote 的「多次生成取众数」机制是为选择题设计的，
+     * 对文本答案完全失效——填空/问答每次生成的文本几乎不可能逐字相同，票数都是 1，
+     * 既收敛不了（`votes[ans] >= ceil(n/2)` 永不满足），又白费最多 3 次调用，
+     * 最后只能取任意一次。主观题只需一次高质量生成即可。
+     *
+     * 返回 normalize 后的原文：Bank.normalize 对填空/问答走「原文返回」分支
+     * （09-bank.js L271），不会把答案字母化，保留 LLM 生成的完整文本。
+     */
+    async ask(question, type) {
+      const raw = await callOnce(question, [], type);
+      // 主观题不走 normalize：normalize 的字母化逻辑会把「维生素A」这类含单个 A-D
+      // 字母的填空/问答答案误转成 'A'（09-bank.js L268 letters.length===1 分支），
+      // 破坏文本答案。主观题只需 trim 后的原文。
+      return String(raw == null ? '' : raw).trim();
+    },
+
+    /** 连通性测试（面板「测试连接」按钮走的就是这里） */
+    async test() {
+      const cfg = ZHS.config;
+      if (!cfg.llmKey) return { ok: false, msg: '未配置 API Key', hint: '请在设置页填写大模型 API Key 并保存。' };
+      try {
+        const r = await callOnce('1+1等于几？只输出数字。', [], 'completion');
+        return { ok: true, msg: '连通正常，返回：' + r.slice(0, 20), hint: '' };
+      } catch (e) {
+        // ★ 这里过去只有 e.message（"请求失败"四个字），用户试完仍然不知道怎么改。
+        // 现在把 hint 一并返回，面板可以直接把解决方案显示给用户。
+        return {
+          ok: false,
+          msg: e.message,
+          hint: e.hint || '',
+          code: e.code || '',
+        };
+      }
+    },
+  };
+
+  ZHS.LLM = LLM;
+})();
+
+/* ===== 11-solver.js ===== */
+/**
+ * 求解层：双通道编排（题库优先 → LLM 兜底）
+ */
+(function () {
+  'use strict';
+  const ZHS = window.ZHS;
+  if (!ZHS || !ZHS.Util) return;
+  // 重入守卫：SPA 二次注入时整个模块直接退出，避免定时器/监听器叠加
+  if (ZHS.__mod11_solver) return;
+  ZHS.__mod11_solver = true;
+  const U = ZHS.Util;
+
+  // 本次运行内的答案缓存：题干 → 答案，避免重复请求
+  const CACHE = new Map();
+  const MAX_CACHE = 500;
+
+  // 「无可用答题通道」提示的节流间隔（毫秒）。
+  // 作业页可能一次跑 20 题，每题弹一次提示会把面板刷爆、
+  // 而且后一条会挤掉前一条，用户反而啥也看不清。60 秒最多提示一次。
+  const NO_CHANNEL_ALERT_COOLDOWN_MS = 60000;
+  let noChannelAlertAt = 0;
+
+  /**
+   * 通道异常日志（带节流 + 透传解决方案）。
+   *
+   * 【2026-09-20 修复 · round-24 漏网】上一轮在网络层和 LLM 层都挂上了 `e.hint`
+   * （可操作的解决建议），但这里 catch 时只取了 `e.message` —— **hint 在求解层断裂**：
+   * 面板「测试连接」那条路能看到建议，而用户真正刷题时的答题路径却看不到。
+   * 只验证其中一条路是假判据，故本轮补上透传。
+   *
+   * 节流原因：作业页一次可能连跑 20 题，同一个故障刷 20 遍会把面板挤空，
+   * 后一条顶掉前一条，用户反而一条也看不清。同类故障 30 秒最多报一次。
+   */
+  const _errAt = Object.create(null);
+  function logChannelFail(kind, e) {
+    const err = e || {};
+    const key = kind + '|' + (err.code || '') + '|' + (err.message || '');
+    const now = Date.now();
+    if (_errAt[key] && now - _errAt[key] < 30000) return;
+    _errAt[key] = now;
+    const hint = err.hint ? '｜建议：' + err.hint : '';
+    ZHS.Log.warn(kind + '：' + (err.message || '未知错误') + hint);
+  }
+
+  function cacheKey(question, options) {
+    return ZHS.Util.normText(question) + '|' + (options || []).join('|').slice(0, 200);
+  }
+
+  function cacheGet(k) { return CACHE.get(k) || null; }
+  function cacheSet(k, v) {
+    if (CACHE.size >= MAX_CACHE) {
+      // 简单淘汰：删最早的一个
+      const first = CACHE.keys().next().value;
+      CACHE.delete(first);
+    }
+    CACHE.set(k, v);
+  }
+
+  // round-45：模糊匹配阈值与最短题干长度。
+  // 90% 是「改几个字/换标点」与「另一道题」之间的经验分界；题干短于 8 字
+  // （归一化后）不模糊 —— 太短的题随便差两个字相似度就很高，容易张冠李戴。
+  const FUZZY_THRESHOLD = 0.9;
+  const FUZZY_MIN_LEN = 8;
+
+  /**
+   * round-45：模糊缓存匹配 —— 题干改几个字/换标点时复用已答过的答案。
+   *
+   * 背景（GitHub 生态调研结论）：题库/LLM 都是按次收费或限速的，而智慧树
+   * 同一道题常以「换行/全半角/标点差异」的变体重复出现，精确缓存永远命不中，
+   * 于是同一道题被反复请求。模糊匹配把这类变体收敛到一次请求。
+   *
+   * 安全约束（误命中代价 = 答错题，比多打一次请求严重得多）：
+   *   · 选项串必须逐字相同（options 参与判等）—— 题干像但选项不同，是另一道题；
+   *   · 相似度 ≥ 90% 且取最高分那一条的答案；
+   *   · 归一化题干短于 8 字不模糊；
+   *   · 总开关 fuzzyCache 关闭时完全不扫描。
+   *
+   * @returns {{r:object, score:number}|null}
+   */
+  function cacheFuzzy(question, options) {
+    if (!ZHS.config.fuzzyCache) return null;
+    const nq = U.normQuestion(question);
+    if (nq.length < FUZZY_MIN_LEN) return null;
+    const optKey = (options || []).join('|').slice(0, 200);
+    let best = null;
+    let bestScore = 0;
+    for (const entry of CACHE.values()) {
+      if (entry.o !== optKey) continue;              // 选项不一致 → 另一道题，绝不复用
+      const score = U.similarity(nq, U.normQuestion(entry.q));
+      if (score > bestScore) { bestScore = score; best = entry; }
+    }
+    if (best && bestScore >= FUZZY_THRESHOLD) {
+      return { r: best.r, score: bestScore };
+    }
+    return null;
+  }
+
+  /**
+   * v0.6.64：比较两个答案是否「一致」。答案可能是字母（A / A,C）或判定词（对/错）。
+   * 用于 LLM 低置信时与离线启发式做第二意见交叉验证。
+   * 字母答案按集合比较（A,C 与 C,A 视为一致）。
+   */
+  function _sameAnswer(a, b) {
+    const norm = (s) => String(s == null ? '' : s).replace(/[\s,，、;；]/g, '').toUpperCase();
+    const na = norm(a);
+    const nb = norm(b);
+    if (!na || !nb) return false;
+    if (na === nb) return true;
+    const sa = na.split('').sort().join('');
+    const sb = nb.split('').sort().join('');
+    return sa === sb;
+  }
+
+  const Solver = {
+    stats: { bank: 0, llm: 0, cache: 0, fuzzy: 0, heuristic: 0, random: 0, skipped: 0, fail: 0 },
+
+    /** 清空缓存 */
+    clearCache() { CACHE.clear(); },
+
+    /**
+     * 主入口：求解一道题
+     * @returns { answer, from, confidence }
+     */
+    async solve(q) {
+      const cfg = ZHS.config;
+      const question = U.normText(q.title || '');
+      const options = q.options || [];
+      const type = q.type || ZHS.Questions.TYPE.UNKNOWN;
+
+      // M8 统计埋点：统一出口包装，成功/跳过/失败都记一笔。
+      // 用可选调用 —— 统计模块未加载、或统计内部抛错，都绝不能影响答题主流程。
+      const done = (r) => {
+        try { if (ZHS.Stats) ZHS.Stats.record(question, r); } catch (e) { /* 统计失败不影响答题 */ }
+        return r;
+      };
+
+      // 0. 命中缓存
+      const key = cacheKey(question, options);
+      const cached = cacheGet(key);
+      if (cached) {
+        ZHS.Log.info('答案命中缓存：' + cached.r.answer);
+        this.stats.cache++;
+        return cached.r;
+      }
+
+      // 0.5 round-45：模糊命中缓存（题干变体：改字/换标点/多空格）→ 复用答案，
+      //     少打一次题库/模型请求。选项不一致不会误命中（见 cacheFuzzy 约束）。
+      const fz = cacheFuzzy(question, options);
+      if (fz) {
+        ZHS.Log.info('答案模糊命中缓存（题干相似度 ' + Math.round(fz.score * 100) + '%），复用：' + fz.r.answer);
+        this.stats.fuzzy++;
+        // 顺便按新题干精确缓存一份，后续同变体直接精确命中，不再扫描。
+        // 注意与精确命中保持一致：不走 done()（Stats.record）——
+        // 这道题的「首次作答」在第一次 solve 时已经记过账了，此处只是复用。
+        cacheSet(key, { q: question, o: (options || []).join('|').slice(0, 200), t: type, r: fz.r });
+        return fz.r;
+      }
+
+      const mode = cfg.answerMode || 'both';
+      let result = null;
+
+      // 1. 通道 A：题库
+      if ((mode === 'bank' || mode === 'both') && cfg.bankEnabled && question) {
+        try {
+          const r = await ZHS.Bank.search(question, options, type);
+          if (r && r.answer) {
+            result = { answer: r.answer, from: 'bank:' + (r.from || 'unknown'), confidence: 'high' };
+            this.stats.bank++;
+          }
+        } catch (e) {
+          // 过去是 debug 级：题库挂了用户完全不知情，只看到「题没答上」。
+          // 提级到 warn 并走统一失败日志（含节流 + 解决方案透传）。
+          logChannelFail('题库查询异常', e);
+        }
+      }
+
+      // 2. 通道 B：LLM 兜底
+      if (!result && (mode === 'llm' || mode === 'both') && cfg.llmEnabled && cfg.llmKey && question) {
+        try {
+          // round-44：主观题（填空/问答，无选项）用单次生成 ask 而非 vote——
+          // vote 的「多次投票取众数」对文本答案失效（每次生成都不同，票数都是 1，
+          // 收敛不了又白费 3 次调用）；选择题才需要投票提稳。
+          const isSubjective = (type === ZHS.Questions.TYPE.COMPLETION
+            || type === ZHS.Questions.TYPE.QA) && !options.length;
+          const ans = (isSubjective && ZHS.LLM.ask)
+            ? await ZHS.LLM.ask(question, type)
+            : await ZHS.LLM.vote(question, options, type, cfg.voteTimes);
+          if (ans) {
+            // v0.6.64：读投票置信（全票一致=high / 过半=medium / 分裂=low）。
+            // 桩替换 vote() 时（单测）_lastMeta 不会被更新，置信停在 'none'——
+            // 此时保持旧的 'medium' 默认，保证测试与既有调用方行为不变。
+            const meta = (!isSubjective && ZHS.LLM.getLastVoteMeta) ? ZHS.LLM.getLastVoteMeta() : null;
+            let confidence = (meta && meta.confidence && meta.confidence !== 'none')
+              ? meta.confidence
+              : 'medium';
+            // 低置信交叉验证：LLM 票型分裂（没把握）时，用离线启发式做第二意见。
+            //   · 两者一致 → 提升为 medium（两个独立信号互相印证，比单边分裂票可信）。
+            //   · 不一致 → 仍采用 LLM（它是有依据的推理，不是瞎选），但保持 low 并告警，
+            //     提醒用户提交前复核。
+            // 关键：绝不因此引入随机兜底——「永不瞎选」由 gatedRandom(默认关) 把守，此处不动。
+            if (meta && confidence === 'low' && options.length
+              && ZHS.Heuristic && cfg.heuristicFallback !== false) {
+              try {
+                const h = ZHS.Heuristic.solve({ title: question, options, type });
+                if (h && h.answer && _sameAnswer(h.answer, ans)) {
+                  confidence = 'medium';
+                  ZHS.Log.info('LLM 低置信但与离线启发式结论一致，置信提升为 medium：' + ans);
+                } else if (h && h.answer) {
+                  ZHS.Log.warn('LLM 低置信（票型分裂）且与启发式不一致（LLM=' + ans
+                    + ' / 启发式=' + h.answer + '），仍采用 LLM，请提交前复核');
+                }
+              } catch (e) { /* 交叉验证失败不影响主流程 */ }
+            }
+            result = { answer: ans, from: 'llm', confidence, voteMeta: meta || null };
+            this.stats.llm++;
+          }
+        } catch (e) {
+          // ★ 关键：这里过去只打 e.message，把网络层/LLM 层挂的 e.hint 丢掉了，
+          // 用户在真实答题路径上依旧只看到「请求失败」四个字。
+          logChannelFail('LLM 求解失败', e);
+        }
+      }
+
+      // 3. 通道 C：离线启发式（round-30 新增）
+      //
+      // 为什么必须补这一层，又为什么必须排在题库/LLM **之后**：
+      //   用户确认的平台行为是「弹题随机弹出、必须答完才能关闭」——
+      //   于是「答不上」的代价不是漏一题，而是**弹窗关不掉、挂机就此中断**。
+      //   而题库要自建服务、LLM 要 API Key，两者都缺席是绝大多数用户的常态，
+      //   旧实现在这时直接跳过 → 一题未答 → 卡死在这一节。
+      //   启发式零外部依赖，至少能把「必卡死」变成「大概率答上并继续」。
+      //   但它只是统计推断，质量低于题库/LLM，故只在它们都没结果时才出场，
+      //   避免拉低已经配好通道的用户本来的答题质量。
+      if (!result && options.length && ZHS.Heuristic && cfg.heuristicFallback !== false) {
+        try {
+          const h = ZHS.Heuristic.solve({ title: question, options, type });
+          if (h && h.answer) {
+            result = { answer: h.answer, from: 'heuristic', confidence: 'low' };
+            this.stats.heuristic++;
+            ZHS.Log.info('离线启发式给出答案 ' + h.answer + '（' + (h.reason || '') + '）');
+          }
+        } catch (e) {
+          logChannelFail('启发式求解异常', e);
+        }
+      }
+
+      // 4. 所有通道都没有时：
+      //    默认【不蒙】——瞎选答案会污染成绩且部分课程不允许回退重做，
+      //    宁可漏答（可事后补答）也不主动制造错答。
+      //    用户显式开启 gatedRandom 才允许兜底蒙一个（保证流程不卡住）。
+      if (!result && options.length) {
+        if (!cfg.gatedRandom) {
+          this.stats.skipped++;
+          ZHS.Log.warn('无可用答题通道，按配置跳过本题（未配置 LLM Key / 题库不可用时发生）');
+          // 节流：60 秒内最多提示一次，避免作业页连续跳题时刷屏
+          const now = Date.now();
+          if (now - noChannelAlertAt > NO_CHANNEL_ALERT_COOLDOWN_MS) {
+            noChannelAlertAt = now;
+            if (ZHS.panel) {
+              ZHS.panel.alert('未找到可用答案，已跳过多题未作答。可在设置里开启「答不出时随机选（保进度）」，或手动作答。', 'warn', 10000);
+            }
+          }
+          return done(null);
+        }
+        const idx = Math.floor(Math.random() * options.length);
+        const letter = String.fromCharCode(65 + idx);
+        result = { answer: letter, from: 'random', confidence: 'low' };
+        this.stats.random++;
+        ZHS.Log.warn('已启用「随机兜底」，本次为随机选择 ' + letter);
+      }
+
+      if (!result) {
+        this.stats.fail++;
+        ZHS.Log.warn('本题无法求解：' + question.slice(0, 40));
+        return done(null);
+      }
+
+      cacheSet(key, { q: question, o: (options || []).join('|').slice(0, 200), t: type, r: result });
+      return done(result);
+    },
+
+    /** 批量求解（顺序，避免打爆接口） */
+    async solveAll(list) {
+      const out = [];
+      for (const q of list) {
+        // eslint-disable-next-line no-await-in-loop
+        const r = await this.solve(q);
+        out.push(Object.assign({}, q, { result: r }));
+        // 每题之间小延迟，模拟人类思考
+        const d = Number(ZHS.config.answerDelay) || 0;
+        if (d > 0) await U.sleep(d * 1000 + Math.random() * 1000);
+      }
+      return out;
+    },
+  };
+
+  ZHS.Solver = Solver;
+})();
+
+/* ===== 11b-heuristic.js ===== */
+/**
+ * 离线启发式求解器（round-30 新增）：零网络、零 Key、零题库也能给出答案。
+ *
+ * 为什么必须有这一层（用户需求根因 · 2026-10-20）：
+ *   「弹窗是随机弹出的答题，没有规律，必须答完题才能关闭」——
+ *   于是「答不上 = 关不掉 = 挂机中断」，而不是旧假设的「答不上就漏一题」。
+ *   而原求解链在最常见的情况下恰好是**一条通道都没有**的：
+ *     题库（09-bank）需要用户自建的服务地址；LLM（10-llm）需要用户填 API Key。
+ *   两条都没配（拉到即用装脚本的绝大多数用户就是这个状态）→ Solver 走到
+ *   `if (!cfg.gatedRandom) → skipped++ → return null` → 答题器一题未答 →
+ *   平台拒绝关闭未作答弹窗 → 脚本卡在这一节，直到用户自己回来点。
+ *
+ *   所以在「答不出」之前，必须补一层**不依赖任何外部资源**的求解：
+ *   它不保证全对，但能把「必卡死」变成「大概率答上并继续」。
+ *
+ * 【能力边界 · 必须写死在文档里】
+ *   本层不做理解，只做语言学与出题套路的统计推断，正确率显著高于随机
+ *   （网课弹题多为课件原文改写，关键词高度复现），但低于 LLM/题库。
+ *   因此排序必须在它们**之后**：有题库/LLM 时轮不到它出场；
+ *   只有它们都缺席或失败时，它才顶上，避免拉低已有的答题质量。
+ *
+ * 【失效判据 · 宁可不说，不可瞎说】
+ *   每条规则都带置信度。总分够线才返回答案；不够线返回 null，
+ *   由上层决定是「随机兜底」还是「转人工」——绝不冒充高分答案。
+ */
+(function () {
+  'use strict';
+  const ZHS = window.ZHS;
+  if (!ZHS || !ZHS.Util) return;
+  // 重入守卫：SPA 二次注入时整个模块直接退出，避免重复挂载
+  if (ZHS.__mod11b_heuristic) return;
+  ZHS.__mod11b_heuristic = true;
+  const U = ZHS.Util;
+
+  /** 去噪：只保留「有信息量」的字符参与文本比对 */
+  function clean(s) {
+    return String(s || '').replace(/[\s\u3000]+/g, ' ').trim();
+  }
+
+  /**
+   * 取出参与匹配的「内容字符」：汉字、字母、数字。
+   *
+   * 为什么要过滤：选项文本里大量的标点、括号、序号前缀
+   * （「A.」「B、」「（ ）」）在题干里不存在，参与比对只会稀释真信号。
+   */
+  function contentChars(s) {
+    return clean(s)
+      .replace(/^\s*[A-Za-z][.、,:：)）]?\s*/, '')   // 剥选项序号前缀
+      .replace(/[，。；：？！、,.;:?!()（）「」【】"'“”‘’\-_/\\]/g, '');
+  }
+
+  /**
+   * 中文二元切分 + 英文单词。
+   *
+   * 为什么不用分词库：油猴脚本不引外部依赖。中文bigram在无分词时是
+   * 最稳的近似——「依法治国」切成 依法/法依… 实际是 依法/法治/治国，
+   * 相邻字对能覆盖绝大多数实词。英文按单词整体保留，避免字母被拆碎。
+   */
+  function grams(s) {
+    const out = [];
+    const t = contentChars(s);
+    let en = '';
+    const push = () => { if (en.length) { out.push(en.toLowerCase()); en = ''; } };
+    for (let i = 0; i < t.length; i++) {
+      const c = t[i];
+      if (/[a-zA-Z0-9]/.test(c)) { en += c; continue; }
+      push();
+      const next = t[i + 1];
+      // 相邻两个非英文字符组成一个 gram
+      if (next && !/[a-zA-Z0-9]/.test(next)) out.push(c + next);
+    }
+    push();
+    return out;
+  }
+
+  /** 词集合（同时产出单字，兼容题干极短时 bigram 打不中的情况） */
+  function tokenSet(s) {
+    const set = new Set();
+    grams(s).forEach((g) => set.add(g));
+    const t = contentChars(s);
+    for (const c of t) if (/[\u4e00-\u9fa5]/.test(c)) set.add(c);
+    return set;
+  }
+
+  /** 题干与单个选项的重合度：命中数 / 选项自身词数（选项短时更敏感） */
+  function overlapRatio(stemSet, optText) {
+    const opt = tokenSet(optText);
+    if (!opt.size) return 0;
+    let hit = 0;
+    opt.forEach((g) => { if (stemSet.has(g)) hit++; });
+    return hit / Math.sqrt(opt.size);   // 开方：抑制长选项靠堆词刷分
+  }
+
+  /** 绝对化词：教材型题目里带这些词的选项大概率是错的（例外见 _isNegatedStem） */
+  const ABSOLUTE = ['一定', '必定', '必然', '所有', '一切', '都 ', '全都', '唯一', '只能', '绝不',
+    '完全', '绝对', '不可能', '永远不会', '无论', '任何', '普遍适用', '无一例外'];
+  /** 弱化/限定词：正确选项的典型口吻（有余地的表述更可能是教材原话） */
+  const HEDGE = ['通常', '一般', '可能', '往往', '在一定条件下', '原则上', '多数', '常常',
+    '有助于', '有利于', '之一', '视情况'];
+
+  /** 题干是否反问式否定（问「哪个不对」）——决定要不要反过来选离群项 */
+  const NEG_STEM = ['不正确', '不属于', '不包括', '不符合', '不是', '错误', '除外', '不应',
+    '不能', '不必', '不包括', '不当', '不准', '不得', '没有'];
+  function isNegatedStem(stem) {
+    return NEG_STEM.some((w) => stem.includes(w));
+  }
+
+  /** 「以上都对」类收尾选项：命中几乎必选（多选题里的经典送分项） */
+  const ALL_TRUE = ['以上都对', '以上都正确', '以上均是', '以上全部', '以上都是', 'A和B', 'A和B都对',
+    '上述都对', '全部正确', '均正确', '都对'];
+
+  /** 判断题选项识别 */
+  const TRUE_WORDS = ['正确', '对', '是', '√', 'true', 't'];
+  const FALSE_WORDS = ['错误', '错', '否', '×', 'false', 'f'];
+
+  function isoLetter(i) { return String.fromCharCode(65 + i); }
+
+  /**
+   * 主求解入口
+   * @param {{title:string, options:string[], type:string}} q
+   * @returns {{answer:string, from:string, confidence:string, score:number, reason:string}|null}
+   */
+  function solve(q) {
+    const opts = (q && q.options) || [];
+    if (!opts.length) return null;
+    const stem = clean((q && q.title) || '');
+    const type = (q && q.type) || '';
+
+    // ===== 规则 0：判断题 —— 先单独处理，它的答案空间只有两个，套路最固定 =====
+    if (type === 'judgement' || (opts.length === 2 && isJudgePair(opts))) {
+      const r = solveJudgement(stem, opts);
+      if (r) return r;
+    }
+
+    const stemSet = tokenSet(stem);
+
+    // ===== 规则 1：收尾式正确项（「以上都对」） =====
+    for (let i = 0; i < opts.length; i++) {
+      const t = clean(opts[i]);
+      if (ALL_TRUE.some((w) => t.includes(w))) {
+        return finish(opts, [i], 'heuristic', 0.9, '命中收尾正确项「' + t.slice(0, 10) + '」');
+      }
+    }
+
+    // ===== 规则 2：包含关系排雷 —— 字面被别的选项覆盖的短项是「片面答案」 =====
+    // 例：A「诚信是美德」 被 B「诚信既是法律规范也是道德要求」覆盖 → A 片面，排除。
+    //
+    // 为什么不能只判「子串包含」：真实题目里片面项与完整项常常**语序不同**
+    // （上例 B 里根本找不到连续的「诚信是美德」），子串判定会全部漏网。
+    // 改用「字级覆盖率」：短项汉字 ≥80% 出现在长项里、且长项明显更长 → 判片面。
+    // 门槛（80% + 长度差 ≥3）刻意设严：汉语里短词被长句覆盖很常见，
+    // 判据一松就会把正确答案误杀，误杀的代价比漏排大得多。
+    const hanOf = (s) => Array.from(contentChars(s)).filter((c) => /[\u4e00-\u9fa5]/.test(c));
+    const contained = new Set();
+    for (let i = 0; i < opts.length; i++) {
+      for (let j = 0; j < opts.length; j++) {
+        if (i === j) continue;
+        const a = hanOf(opts[i]);
+        const b = hanOf(opts[j]);
+        if (!a.length || !b.length) continue;
+        if (b.length < a.length + 3) continue;
+        const bset = new Set(b);
+        const covered = a.filter((c) => bset.has(c)).length;
+        if (covered / a.length >= 0.8) { contained.add(i); break; }
+      }
+    }
+
+    // ===== 规则 3：逐项打分 =====
+    const raw = opts.map((text, i) => {
+      const t = clean(text);
+      let score = overlapRatio(stemSet, text) * 10;   // 主信号：与题干的词汇重合
+
+      // 与题干无关怎么写得到的固定加成/惩罚
+      if (ABSOLUTE.some((w) => t.includes(w))) score -= 4;      // 绝对化表述
+      if (HEDGE.some((w) => t.includes(w))) score += 1.5;       // 留有余地的表述
+      if (contained.has(i)) score -= 6;                          // 被包含的片面项
+
+      // 长度惩罚：偏离均值越远越可疑（过长多为编出来的干扰项）
+      const avg = opts.reduce((s, x) => s + contentChars(x).length, 0) / opts.length;
+      const dev = Math.abs(contentChars(text).length - avg) / (avg || 1);
+      if (dev > 1.2) score -= 3;
+      else if (dev < 0.35) score += 0.5;                         // 长度中庸微微加分
+
+      return { i, score, t };
+    });
+
+    const neg = isNegatedStem(stem);
+    // 否定式题干：要的是「最不符合」的那个 → 分数取反，选最离群的
+    const ranked = raw.slice().sort((a, b) => (neg ? a.score - b.score : b.score - a.score));
+
+    // 只有题干有实质内容时，词汇重合才是信号；空题干(PPT截图题)只剩套路规则
+    const stemStrong = stemSet.size >= 4;
+    const top = ranked[0];
+    const second = ranked[1];
+
+    if (!top) return null;
+
+    // 多选题：取分数显著优于后半段的那几项。没有明显断层就退回单选意识（只取一项）
+    const isMultiple = type === 'multiple'
+      || (opts.length >= 4 && /哪些|哪些选项|属于|包括|包含/.test(stem) && !neg);
+
+    if (isMultiple) {
+      const picks = pickMultiple(ranked, neg);
+      if (picks.length) {
+        return finish(opts, picks, 'heuristic', 0.55, '多选题 heuristic 取前 ' + picks.length + ' 项');
+      }
+    }
+
+    // 单选：分差必须拉开，否则这是「瞎选」而不是「推断」 → 认输返回 null
+    const gap = second ? Math.abs(top.score - second.score) : 99;
+    const minScore = stemStrong ? 3.5 : 0.5;
+    if (top.score < minScore) return null;
+    if (gap < 1.2 && stemStrong) return null;   // 并列领跑 = 没推断出来
+
+    const reason = neg ? '否定式题干：取与题干重合最低项' : '取与题干重合最高项';
+    const conf = gap >= 4 ? 0.6 : 0.45;
+    return finish(opts, [top.i], 'heuristic', conf, reason);
+  }
+
+  /** 两个选项是否构成「对/错」判断题组合 */
+  function isJudgePair(opts) {
+    const a = clean(opts[0]);
+    const b = clean(opts[1]);
+    const hitA = TRUE_WORDS.some((w) => a === w || a === w + '的' ) || /^(正确|对|是|√)$/.test(a);
+    const hitB = FALSE_WORDS.some((w) => b === w || b === w + '的') || /^(错误|错|否|×)$/.test(b);
+    const hitA2 = FALSE_WORDS.some((w) => a === w || a === w + '的') || /^(错误|错|否|×)$/.test(a);
+    const hitB2 = TRUE_WORDS.some((w) => b === w || b === w + '的') || /^(正确|对|是|√)$/.test(b);
+    return (hitA && hitB) || (hitA2 && hitB2);
+  }
+
+  /**
+   * 判断题：教材型陈述绝大多数是对的；但题干或选项带绝对化词时反转为错。
+   * 这是一条纯统计规律，正确率约七成——远高于盲选五成，够用来「把弹窗关掉」。
+   */
+  function solveJudgement(stem, opts) {
+    const hasTrue = opts.findIndex((t) => /^(正确|对|是|√)/.test(clean(t)) || TRUE_WORDS.indexOf(clean(t)) >= 0);
+    const hasFalse = opts.findIndex((t) => /^(错误|错|否|×)/.test(clean(t)) || FALSE_WORDS.indexOf(clean(t)) >= 0);
+    if (hasTrue < 0 || hasFalse < 0) return null;
+    const absolute = ABSOLUTE.some((w) => stem.includes(w));
+    const pick = absolute ? hasFalse : hasTrue;
+    return finish(opts, [pick], 'heuristic', absolute ? 0.55 : 0.5,
+      absolute ? '判断题：题干含绝对化词 → 判错' : '判断题：教材陈述默认判对');
+  }
+
+  /**
+   * 多选题挑 tribunal：取分数为正（单选贡献）且落在前 60% 的项。
+   * 为什么限制数量：网课多选多为 2~3 个正确项，全选和只选一个都容易错。
+   */
+  function pickMultiple(ranked, neg) {
+    const cands = neg ? ranked.slice().reverse() : ranked;
+    const positive = cands.filter((r) => (neg ? r.score < 0 : r.score > 0));
+    const pool = positive.length >= 2 ? positive : cands;
+    // 取前 2~3 项：网课多选正解多为 2~3 个，全选和单选都容易错
+    const max = Math.max(2, Math.min(3, Math.round(pool.length / 3)));
+    return pool.slice(0, max).map((r) => r.i);
+  }
+
+  /** 统一出口：索引 → 字母 */
+  function finish(opts, idxs, from, confidence, reason) {
+    const letters = idxs.slice().sort((a, b) => a - b).map((i) => isoLetter(i)).join('');
+    if (!letters) return null;
+    return { answer: letters, from, confidence, score: confidence, reason };
+  }
+
+  const Heuristic = {
+    solve,
+    // 只读暴露内部构件，供单测锁死边界（避免依赖真实 DOM 才能测）
+    _grams: grams,
+    _tokenSet: tokenSet,
+    _overlapRatio: overlapRatio,
+    _isNegatedStem: isNegatedStem,
+    _isJudgePair: isJudgePair,
+    _solveJudgement: solveJudgement,
+  };
+
+  ZHS.Heuristic = Heuristic;
+})();
+
+/* ===== 12-filler.js ===== */
+/**
+ * 回填层：把答案填进页面控件，并校验是否真的填上
+ */
+(function () {
+  'use strict';
+  const ZHS = window.ZHS;
+  if (!ZHS || !ZHS.Util) return;
+  // 重入守卫：SPA 二次注入时整个模块直接退出，避免定时器/监听器叠加
+  if (ZHS.__mod12_filler) return;
+  ZHS.__mod12_filler = true;
+  const U = ZHS.Util;
+
+  const SEL_CLASSES = ['is-checked', 'checked', 'active', 'selected', 'choosed', 'chosen', 'current', 'highlight', 'picked'];
+
+  function hasSelClass(el) {
+    try {
+      if (!el.classList) return false;
+      for (const c of el.classList) { if (SEL_CLASSES.indexOf(String(c).toLowerCase()) >= 0) return true; }
+    } catch (e) { /* 忽略 */ }
+    return false;
+  }
+
+  /** 严格选中判定（仅用于「已选中则跳过点击」的防取消守卫，避免被样式类误判） */
+  function isClearlyChecked(el) {
+    if (!el) return false;
+    try {
+      if (el.getAttribute && el.getAttribute('aria-checked') === 'true') return true;
+      const input = el.querySelector ? el.querySelector('input') : (el.matches && el.matches('input') ? el : null);
+      if (input && input.checked) return true;
+      if (el.classList && (el.classList.contains('is-checked') || el.classList.contains('checked'))) return true;
+    } catch (e) { /* 忽略 */ }
+    return false;
+  }
+
+  /** 宽口径选中判定（用于点击后自检：选中态可能表现为 aria/类名/子 input/子节点标记） */
+  function isChecked(el) {
+    if (!el) return false;
+    try {
+      if (isClearlyChecked(el)) return true;
+      if (el.getAttribute) {
+        if (el.getAttribute('aria-selected') === 'true' || el.getAttribute('aria-pressed') === 'true') return true;
+      }
+      if (hasSelClass(el)) return true;
+      const p = el.closest && el.closest('.is-checked,.checked,.active,.selected,.choosed,.chosen,.current,.highlight');
+      if (p) return true;
+      if (el.querySelector) {
+        const marked = el.querySelector('.is-checked,.checked,.active,.selected,.choosed,.chosen,.current,.highlight,[aria-checked="true"]');
+        if (marked) return true;
+      }
+      // round-38【关键修复·调研 grounding】：智慧树课中弹题的「选中态」既不是 class 也不是
+      // input.checked，而是 SVG 图标 <use> 的 href —— 未选中 #iconxuan，选中 #iconxuanzhong
+      // （Natro92 逆向 + ocsjs/greasyfork 实现印证）。旧 isChecked 完全不认这个信号，于是
+      // 「明明点中了也判未选中」→ 继续乱点 → 把已选中的点乱 → 误报选不中。必须单独识别。
+      try {
+        if (el.querySelectorAll) {
+          const icons = el.querySelectorAll('use, [href], [xlink\\:href]');
+          for (const ic of icons) {
+            const h = String((ic.getAttribute && (ic.getAttribute('href') || ic.getAttribute('xlink:href'))) || '');
+            // 只认「选中」语义的图标引用；#iconxuan（未选中）不含 zhong，不会误命中
+            if (h && /xuanzhong|zhongzhong|icon[_-]?(selected|checked|chosen|on)|radio[_-]?(on|checked|selected)/i.test(h)) return true;
+          }
+        }
+      } catch (e) { /* 忽略 */ }
+    } catch (e) { /* 忽略 */ }
+    return false;
+  }
+
+  /**
+   * 点击一个选项并确认选中（round-37：大幅强化，修「选项点击后仍未选中」）。
+   * 对 AI助教/按钮式/div 式选项：逐个候选子目标 × 多种点击方式尝试，每步后自检 isChecked，
+   * 一旦选中即收手；最后再上 input.checked 强制兜底。已明确选中的则跳过（防取消）。
+   */
+  async function clickOption(el) {
+    if (!el) return false;
+    if (isClearlyChecked(el)) {
+      ZHS.Log.debug('选项已选中，跳过点击（防取消）');
+      return true;
+    }
+    const sleep = (ms) => U.sleep(ms);
+
+    // round-39 主路径（ocsjs 原厂做法）：对选项本体**单次原生 click** —— 真机验证过即可选中，
+    // 绝不连点（早期 20 连发式过度点击反而把已选中的点乱/误触）。SVG 自检通过即收手。
+    try { el.click(); } catch (e) { /* 忽略 */ }
+    await sleep(300);
+    if (isChecked(el)) return true;
+
+    const fireOne = async (t) => {
+      if (!t) return false;
+      try { if (U.realClickHuman) U.realClickHuman(t); else t.click(); } catch (e) { /* 忽略 */ }
+      await sleep(160);
+      if (isChecked(el)) return true;
+      try { t.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); } catch (e) { /* 忽略 */ }
+      await sleep(120);
+      return isChecked(el);
+    };
+
+    // 候选点击目标：从「最可能带处理器」到宽兜底
+    const cands = [];
+    const add = (s) => { try { const c = el.querySelector(s); if (c && cands.indexOf(c) < 0) cands.push(c); } catch (e) {} };
+    add('.el-radio__input:not(.is-checked)');
+    add('.el-checkbox__input:not(.is-checked)');
+    add('.el-radio__inner'); add('.el-checkbox__inner');
+    add('[class*="radio"]'); add('[class*="check"]'); add('[class*="circle"]'); add('[class*="icon"]');
+    add('label'); add('input'); add('span'); add('a'); add('i');
+    cands.push(el);   // 最后点本体
+
+    for (const t of cands) {
+      // eslint-disable-next-line no-await-in-loop
+      if (await fireOne(t)) return true;
+    }
+
+    // ===== round-37b：三种本质不同的点击机制（治「子目标都点过仍选不中」） =====
+    // (a) 坐标点击最顶层元素：选项若被遮罩/蒙层盖住，点元素本身被拦，点坐标命中的才是真控件
+    try {
+      const r = el.getBoundingClientRect();
+      if (r.width > 0 && r.height > 0) {
+        const cx = r.x + r.width / 2, cy = r.y + r.height / 2;
+        const top = document.elementFromPoint(cx, cy);
+        if (top && top !== el) {
+          if (U.realClickHuman) U.realClickHuman(top); else { try { top.click(); } catch (e) {} }
+          await sleep(200);
+          if (isChecked(el)) return true;
+        }
+      }
+    } catch (e) { /* 忽略 */ }
+
+    // (b) 指针事件：现代框架（含部分 AI 部件）监听 pointerdown/pointerup 而非 mouse 事件
+    try {
+      const r = el.getBoundingClientRect();
+      const base = { bubbles: true, cancelable: true, view: window, composed: true, pointerType: 'mouse', isPrimary: true, button: 0, clientX: r.x + r.width / 2, clientY: r.y + r.height / 2 };
+      if (window.PointerEvent) {
+        el.dispatchEvent(new PointerEvent('pointerover', base));
+        el.dispatchEvent(new PointerEvent('pointerdown', Object.assign({}, base, { buttons: 1 })));
+        el.dispatchEvent(new PointerEvent('pointerup', Object.assign({}, base, { buttons: 0 })));
+        el.dispatchEvent(new PointerEvent('click', base));
+        await sleep(200);
+        if (isChecked(el)) return true;
+      }
+    } catch (e) { /* 忽略 */ }
+
+    // (c) 聚焦 + 键盘：radio 组常用 空格/回车/方向键 切换选中
+    try {
+      if (el.focus) el.focus();
+      const keys = [[' ', 32], ['Enter', 13], ['ArrowRight', 39], ['ArrowDown', 40]];
+      for (const [key, kc] of keys) {
+        el.dispatchEvent(new KeyboardEvent('keydown', { key, code: key === ' ' ? 'Space' : key, keyCode: kc, which: kc, bubbles: true, cancelable: true }));
+        el.dispatchEvent(new KeyboardEvent('keyup', { key, code: key === ' ' ? 'Space' : key, keyCode: kc, which: kc, bubbles: true, cancelable: true }));
+        // eslint-disable-next-line no-await-in-loop
+        await sleep(120);
+        if (isChecked(el)) return true;
+      }
+    } catch (e) { /* 忽略 */ }
+
+    // 强制兜底：直接置 input.checked + 派发事件
+    const input = el.querySelector ? el.querySelector('input') : (el.matches && el.matches('input') ? el : null);
+    if (input) {
+      try {
+        input.checked = true;
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        try { if (input.click) input.click(); } catch (e) { /* 忽略 */ }
+        await sleep(150);
+        if (input.checked || isChecked(el)) return true;
+      } catch (e) { /* 忽略 */ }
+    }
+
+    ZHS.Log.warn('选项点击后仍未选中');
+    return false;
+  }
+
+  /**
+   * round-37b：选项选不中时的诊断转储——把选项真实 DOM 结构打进日志，供精准修复。
+   * 输出：root 信息/是否 shadow/iframe、每个选项的 tag/class/属性/坐标/是否被遮罩
+   * （elementFromPoint）/onclick/完整 HTML 片段、弹窗内 radio 选中态。
+   */
+  function dumpDiag(root, els) {
+    const lines = [];
+    const t = () => new Date().toLocaleTimeString();
+    try {
+      lines.push('=== 选项诊断 ' + t() + '（请把这段发给开发者） ===');
+      if (root) {
+        const rr = root.getBoundingClientRect ? root.getBoundingClientRect() : { x: 0, y: 0, width: 0, height: 0 };
+        const path = []; let n = root;
+        while (n && path.length < 8) { path.push(n.tagName + (n.id ? '#' + n.id : '') + ((n.className && n.className.toString) ? '.' + n.className.toString().split(/\s+/).slice(0, 2).join('.') : '')); n = n.parentElement; }
+        lines.push('root: ' + path.join(' < ') + ' | shadow=' + (root.getRootNode ? (root.getRootNode() instanceof ShadowRoot) : '?')
+          + ' | rect=' + Math.round(rr.x) + ',' + Math.round(rr.y) + ',' + Math.round(rr.width) + 'x' + Math.round(rr.height));
+      }
+      try {
+        const ifr = Array.from(document.querySelectorAll('iframe')).map((f) => (f.src || '').slice(0, 80)).filter(Boolean);
+        lines.push('iframes: ' + JSON.stringify(ifr.slice(0, 8)));
+      } catch (e) { lines.push('iframes err: ' + e.message); }
+      (els || []).slice(0, 6).forEach((el, i) => {
+        try {
+          const r = el.getBoundingClientRect();
+          const cx = r.x + r.width / 2, cy = r.y + r.height / 2;
+          let at = null; try { at = document.elementFromPoint(cx, cy); } catch (e) {}
+          const attrs = {}; try { Array.from(el.attributes || []).forEach((a) => { attrs[a.name] = String(a.value).slice(0, 60); }); } catch (e) {}
+          lines.push('opt' + i + ': <' + el.tagName + '> cls="' + (el.className || '').toString().slice(0, 120) + '"');
+          lines.push('  attrs=' + JSON.stringify(attrs));
+          lines.push('  rect=' + Math.round(r.x) + ',' + Math.round(r.y) + ',' + Math.round(r.width) + 'x' + Math.round(r.height)
+            + ' onclick=' + (el.getAttribute ? !!el.getAttribute('onclick') : '?')
+            + ' shadow=' + (el.getRootNode ? (el.getRootNode() instanceof ShadowRoot) : '?'));
+          lines.push('  elementFromPoint(center)=' + (at ? at.tagName + '.' + (at.className || '').toString().slice(0, 40) : 'null')
+            + ' sameAsEl=' + (at === el) + ' coveredBy=' + (at && at !== el && !el.contains(at) ? 'YES(被其它元素盖住)' : 'no'));
+          lines.push('  html=' + (el.outerHTML || '').replace(/\s+/g, ' ').slice(0, 500));
+        } catch (e) { lines.push('opt' + i + ' err: ' + e.message); }
+      });
+      try {
+        const scope = (root && root.querySelectorAll) ? root : document;
+        const radios = Array.from(scope.querySelectorAll('input[type="radio"], input[type="checkbox"]'))
+          .slice(0, 12).map((r, idx) => idx + ':' + (r.checked ? '✓' : '✗') + ':' + (r.name || '') + ':' + (r.className || '').toString().slice(0, 30));
+        lines.push('radios: ' + JSON.stringify(radios));
+      } catch (e) { lines.push('radios err: ' + e.message); }
+      lines.push('=== 诊断结束 ===');
+    } catch (e) { lines.push('诊断异常: ' + e.message); }
+    lines.forEach((l) => { try { ZHS.Log.warn(l); } catch (e) {} });
+  }
+
+  /** 填文本（填空/简答） */
+  async function fillText(el, text) {
+    if (!el) return false;
+    const input = el.querySelector
+      ? (el.querySelector('textarea, input[type="text"]') || (el.matches && el.matches('textarea, input[type="text"]') ? el : null))
+      : null;
+    if (!input) {
+      ZHS.Log.warn('未找到可填写的输入框');
+      return false;
+    }
+    try {
+      input.focus();
+      input.value = String(text);
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+      input.blur();
+      await U.sleep(150);
+      return input.value === String(text);
+    } catch (e) {
+      ZHS.Log.warn('填写失败：' + e.message);
+      return false;
+    }
+  }
+
+  const Filler = {
+    isChecked,
+    isClearlyChecked,
+    dumpDiag,
+    /**
+     * 点击一个选项（对外暴露）。
+     * 原先 clickOption 只在模块内部使用，13-answerer.js 的 A/B 兜底路径
+     * 只能用裸 `el.click()` —— 而 Element UI 的 .el-radio 外层 label 被点常常不生效，
+     * 需要点内层 .el-radio__input + input.checked 兜底。统一走这里，避免两套点击逻辑漂移。
+     */
+    clickOption,
+
+    /**
+     * 按答案回填一道题
+     * @returns { ok, filled, total }
+     */
+    async fill(q, result) {
+      if (!result || !result.answer) return { ok: false, filled: 0, total: 0 };
+
+      const type = q.type || ZHS.Questions.TYPE.UNKNOWN;
+      const answer = result.answer;
+      const list = q.elementList || [];
+
+      // --- 判断 / 单选 / 多选：点选项 ---
+      if (type === 'judgement') {
+        // 按文本匹配 "对"/"错"
+        let hit = null;
+        for (const el of list) {
+          const t = U.normText(el.innerText || el.textContent);
+          if (answer === '对' && /^(对|正确|是|√|T\b|True)/i.test(t)) { hit = el; break; }
+          if (answer === '错' && /^(错|错误|否|×|F\b|False)/i.test(t)) { hit = el; break; }
+        }
+        if (!hit) {
+          // 兜底：索引 0=对，1=错
+          hit = list[answer === '对' ? 0 : 1] || null;
+        }
+        if (hit) {
+          const ok = await clickOption(hit);
+          return { ok, filled: ok ? 1 : 0, total: 1 };
+        }
+        return { ok: false, filled: 0, total: 1 };
+      }
+
+      if (type === 'single' || type === 'multiple' || type === 'unknown') {
+        const idxs = ZHS.Bank.toIndexes(answer);
+        if (!idxs.length) {
+          ZHS.Log.warn('答案无法转成选项索引：' + answer);
+          return { ok: false, filled: 0, total: list.length };
+        }
+        let filled = 0;
+        for (const i of idxs) {
+          const el = list[i];
+          if (!el) continue;
+          // eslint-disable-next-line no-await-in-loop
+          const ok = await clickOption(el);
+          if (ok) filled++;
+        }
+        return { ok: filled > 0, filled, total: idxs.length };
+      }
+
+      // --- 填空 / 简答：填文本 ---
+      if (type === 'completion' || type === 'qa') {
+        const container = q.node || (list.length ? list[0].closest('.subject_node, .question-item') : null) || document;
+        const ok = await fillText(container, answer);
+        return { ok, filled: ok ? 1 : 0, total: 1 };
+      }
+
+      return { ok: false, filled: 0, total: 0 };
+    },
+  };
+
+  ZHS.Filler = Filler;
+})();
+
+/* ===== 13-answerer.js ===== */
+/**
+ * 答题编排层：把「采集 → 求解 → 回填」串成完整流程
+ */
+(function () {
+  'use strict';
+  const ZHS = window.ZHS;
+  if (!ZHS || !ZHS.Util) return;
+  // 重入守卫：SPA 二次注入时整个模块直接退出，避免定时器/监听器叠加
+  if (ZHS.__mod13_answerer) return;
+  ZHS.__mod13_answerer = true;
+  const U = ZHS.Util;
+
+  const Answerer = {
+    _running: false,
+    _answeredSig: '',       // 已成功作答完成的弹题签名（去重跳过用）
+    _noSelfCheckSig: '',    // round-10 A3：上一轮判定「点击未生效/无法自检」的题签名
+    _noSelfCheckUntil: 0,   // round-10 A3：该判定的节流截止时间
+    _giveUpSigs: null,      // round-13：已放弃处理的弹窗签名集合（关不掉/非标准答题），避免每轮死磕关闭刷屏
+    _countedSig: '',        // round-17：本轮已计入 answeredCount 的弹窗签名
+                            // （标准链路先答一次、A/B 兜底再答一次会重复计数，同一个弹窗只许计一次）
+    _skippedSigs: null,     // 无通道已跳过的弹题签名集合
+    _lastSkipWarnAt: 0,     // 跳过告警节流时间戳
+    _failCount: 0,          // 同一弹题连续处理失败次数
+    _cooldownUntil: 0,      // 退避截止时间戳
+    _pendingHuman: false,   // 本题未答上/关不掉 → 等人工，期间不再自动关闭和反复告警
+    _lastSolvedIdxs: [],    // round-37：本题求解出的答案选项索引，未选中时供 _ensureAnsweredThenClose 优先重试
+
+    /**
+     * 弹题处理（课中）
+     * @param opts.manual 手动触发（面板「答题」按钮）：绕过 autoAnswer 配置，用户点了就答
+     */
+    async handleDialog(opts) {
+      const manual = !!(opts && opts.manual);
+      if (this._running) return;
+      // 手动模式绕过配置；自动模式要求两个开关都为真：
+      //   autoAnswer    = AI 答题总开关
+      //   answerDialog  = 「课中弹题自动答」子开关
+      // 为什么两个都要查：调用方（调度器守卫 2）虽然已做双重校验，但本函数是 public API
+      // （面板「答题」按钮也能直接调用）。只查总开关的话，任何新增调用点都会绕开子开关，
+      // 在用户明确关掉「课中弹题自动答」的情况下仍然替他答题。
+      if (!manual && (!ZHS.config.autoAnswer || !ZHS.config.answerDialog)) return;
+
+      // 退避期内不重试作答（防止关闭失败导致死循环作答）。
+      // 但退避 ≠ 卡死：主循环会走 forceCloseDialog() 直接关弹窗恢复播放。
+      if (!manual && Date.now() < this._cooldownUntil) {
+        ZHS.Log.debug('弹题处理处于退避期，跳过作答（还剩 '
+          + Math.ceil((this._cooldownUntil - Date.now()) / 1000) + ' 秒）');
+        return;
+      }
+
+      const root = ZHS.Questions.Dialog.root();
+      if (!root) {
+        // 弹窗已消失（人工答完/平台收走）→ 复位待人工标记，让下一道题正常走流程
+        this._pendingHuman = false;
+        // round-8 A1：弹窗消失即解除退避，否则退避期内新弹题会被跳过且不答（旧题卡死新题）
+        this._cooldownUntil = 0;
+        if (this._giveUpSigs) this._giveUpSigs = new Set(); // round-13：弹窗消失，重置放弃集合，下一题可正常处理
+        return;
+      }
+
+      // round-39b：AI 助教随堂练习弹题分流（Root Cause：此前它命中 QUESTION_SELECTORS 被
+      // 守卫 2 交给本 Answerer 的 isChecked 门控流，而 AI 弹窗选中态常不可见 → 永远"选不中"）。
+      // 现改走 ocsjs 同款简单处理器：选一项→提交→关闭→以「弹窗消失」验收，绝不依赖选中态。
+      if (this._isAiExercise(root)) {
+        await this._handleAiExercise(root);
+        return;
+      }
+
+      // 防止同一份弹题重复处理（用题干+选项拼接作签名）。
+      // 手动触发例外：用户主动点了「答题」按钮，即使签名没变也必须重试，
+      // 否则按钮看起来就是「点了没反应」。
+      //
+      // 【P2-2 修复 · 2026-09-19】签名必须**叠加选项文本**。
+      // 起因：无标准题面的弹窗（题面靠 .el-dialog__title 这类固定文案兜底，例如"课中答题"），
+      // 同一课程内多道题的标题完全一样 → 签名全相同 → 第二道起被 `sig === _answeredSig`
+      // 误判「已作答完成」跳过，用户看到「只有第一道会答」。
+      // 选项文本能区分同一标题下的不同题（题干+选项一起构成题的指纹），故纳入签名。
+      const snapshot = ZHS.Questions.Dialog.collect();
+      const sig = JSON.stringify(snapshot.map(
+        (s) => (s.title || '') + '|' + ((s.options || []).join(','))
+      )).slice(0, 200);
+      // round-13：本题已放弃处理（非标准 A/B 简单答题，自动随机选都没猜对）。
+      // 直接跳过，不再每轮死磕关闭刷屏；弹窗消失后（handleDialog 的 !root 分支）会自动清空放弃集合。
+      if (this._giveUpSigs && this._giveUpSigs.has(sig) && !this._isClassicAiQuiz(root)) {
+        ZHS.Log.debug('本题已放弃处理（非标准 A/B 答题，自动未猜对），跳过检测');
+        return;
+      }
+      // 已成功作答完成的弹题才去重跳过；无通道/未答上的弹题仍需每轮重试关闭（避免卡死）
+      // 知到弹题例外：平台可能把同一道题重新插回来，必须每轮都再看一眼（_hardHidden 会快速处理）。
+      if (!manual && sig && sig === this._answeredSig && !this._isClassicAiQuiz(root)) {
+        ZHS.Log.debug('弹题已作答完成，跳过重复处理');
+        return;
+      }
+
+      // 真机知到课中弹题：选项点击不改选中态，标准链路的 isChecked 自检必然失败。
+      // 必须在进标准链路之前分流，否则会判「没答完不关」并把弹窗一直挂着。
+      if (!manual && this._isClassicAiQuiz(root)) {
+        this._running = true;
+        try {
+          ZHS.Log.info('检测到课中弹题（知到弹题），开始自动作答');
+          await this._handleClassicAiQuiz(root, sig);
+        } catch (e) {
+          ZHS.Log.error('课中弹题处理失败：' + (e && e.message));
+        } finally {
+          this._running = false;
+        }
+        return;
+      }
+
+      this._running = true;
+      try {
+        const before = ZHS.state.answeredCount;
+        ZHS.Log.info('检测到课中弹题，开始自动作答' + (manual ? '（手动触发）' : ''));
+        await this._answerDialog(root, sig);
+
+        // 用户手动点了「答题」却一题都没答——最常见的原因是没有可用答题通道
+        // （未填 API Key / 题库查不到）。此时按策略不该瞎蒙，但必须给用户反馈，
+        // 否则按钮看起来就是「点了没反应」。
+        if (manual && ZHS.state.answeredCount === before) {
+          const skipped = ZHS.Solver && Number(ZHS.Solver.stats.skipped) > 0;
+          const reason = skipped
+            ? '没有可用答题通道（未配置大模型密钥，或题库查不到）'
+            : '未能识别到题目或选项';
+          ZHS.Log.warn('手动答题未产生作答：' + reason);
+          if (ZHS.panel) {
+            ZHS.panel.alert(
+              reason + '，已跳过本题未作答（瞎蒙会错答拉分）。'
+              + '可在设置里开启「答不出时随机选（保进度）」。',
+              'warn', 10000
+            );
+          }
+        }
+      } catch (e) {
+        ZHS.Log.error('弹题处理失败：' + (e && e.message));
+      } finally {
+        this._running = false;
+      }
+    },
+
+    /**
+     * 退避期兜底（用户需求：「不要停住」）：
+     * 不作答，直接尝试关闭弹窗并恢复播放，保证流程永不卡死。
+     * 由调度器守卫在退避期内调用。
+     */
+    async forceCloseDialog() {
+      const Q = ZHS.Questions.Dialog;
+      if (!Q.stillPresent()) return true;
+      const ok = Q.close();
+      await U.sleep(700);
+      if (!Q.stillPresent()) {
+        ZHS.Log.info('退避期内已直接关闭弹题，恢复播放');
+        this._resumePlay();
+        return true;
+      }
+      return false;
+    },
+
+    async _answerDialog(root, sig) {
+      // 每次处理新弹题都重置「无通道/无法自检」标记，避免上一题的状态污染本题
+      this._noChannelThisRound = false;
+      this._noSelfCheck = false;
+
+      // round-13：识别「非标准 A/B 简单答题」弹窗（如 .el-dialog 容器，标准题面/选项均识别不到）。
+      // 这类弹窗是「选对才能关」的简单 A/B 题，平台不按标准课中弹题结构渲染，
+      // 强行点 .el-dialog__close 三次全失败、刷屏卡死。直接走随机选 A/B 专用逻辑，不进标准求解。
+      const qSnap = (ZHS.Questions.Dialog.readCurrent && ZHS.Questions.Dialog.readCurrent(root)) || null;
+      const nonStandardOpts = (qSnap && qSnap.options) || [];
+      if (!nonStandardOpts.length) {
+        await this._tryNonStandardAB(root, sig);
+        return;
+      }
+
+      // round-10 A3：上一轮已判定本题「点击未生效/无法自检」，在节流期内直接尝试关闭恢复，
+      // 跳过 ZHS.Solver.solve 重复重作答，避免反复求解刷屏；节流到期后再恢复重试。
+      if (sig && sig === this._noSelfCheckSig && Date.now() < this._noSelfCheckUntil) {
+        ZHS.Log.info('本题已判定无法自检，节流期内直接尝试关闭并恢复播放（跳过重复重作答）');
+        const ok = await this.closeDialogAndResume({ noChannel: true });
+        if (!ok) { this._resumePlay(); this._throttledSkipWarn(sig); }
+        return;
+      }
+      const pages = Array.from(root.querySelectorAll('.el-pager .number'));
+      let anyAnswered = false;
+      let allAnswered = false;   // round-9 A2：多页弹题需全部页都答上才算完整完成
+
+      if (!pages.length) {
+        // 单页弹题
+        anyAnswered = await this._solveCurrentPage(root);
+        allAnswered = anyAnswered;
+      } else {
+        // 多页：逐页切换作答
+        let every = true;
+        for (let i = 0; i < pages.length; i++) {
+          const page = pages[i];
+          if (!page.classList.contains('active')) {
+            page.click();
+            await U.sleep(600);
+          }
+          const pageAnswered = await this._solveCurrentPage(root);
+          anyAnswered = anyAnswered || pageAnswered;
+          if (!pageAnswered) every = false;   // round-9 A2：任一页未答上 → 整体未完成
+        }
+        allAnswered = every;
+      }
+
+      await U.sleep(500);
+
+      // N4：按配置决定是否自动关闭弹题
+      if (ZHS.config.autoCloseDialog === false) {
+        ZHS.Log.info('已作答完成（自动关闭已关闭，请手动关闭弹题）');
+        this._answeredSig = sig || '';   // 标记已作答，避免下一轮因签名变化反复点击取消已选项
+        return;
+      }
+
+      // 核心修复（平台规则：未作答的弹题不能关闭）：
+      // 只有本题**实际作答成功**（选项真的被选中）才尝试自动关闭；
+      // 没答上就硬关只会被平台弹「未作答的弹题不能关闭」拒绝，
+      // 然后脚本陷入「关不掉 → 退避 → 再关」的死循环骚扰。
+      // 没答上时正确做法：保留弹窗交给用户手动作答，脚本安静等待。
+      if (!anyAnswered) {
+        // round-37：严格遵守「没答完不能关闭」。不再一来自检不过就硬关（硬关只会被平台
+        // 拒绝 → 关不掉死循环）。改为：逐个尝试选项（优先已求解答案），每步代码等待 +
+        // isChecked 自检，**确认选中后才等待+关闭**；逐个都选不中则转人工保留弹窗。
+        await this._ensureAnsweredThenClose(root, sig, this._lastSolvedIdxs || []);
+        return;
+      }
+      // round-9 A2：多页弹题若只有部分页答上，不标记完整完成，避免剩余页被永久跳过。
+      // 无通道/无法自检 → 尝试关闭已答页并恢复播放，下一轮回来补答剩余页（不置 _answeredSig）；
+      // 有通道但部分页点不上 → 转人工保留弹窗补全。
+      if (!allAnswered) {
+        if (this._noChannelThisRound || this._noSelfCheck) {
+          // round-10 A3：记录本题为「无法自检/无通道」，下一轮节流跳过重复重作答
+          this._noSelfCheckSig = sig || '';
+          this._noSelfCheckUntil = Date.now() + 30000;
+          const ok = await this.closeDialogAndResume({ noChannel: true });
+          if (!ok) { this._resumePlay(); this._throttledSkipWarn(sig); }
+          // 注意：不置 _answeredSig，下一轮 handleDialog 回来继续补答剩余页
+        } else {
+          this._pendingHuman = true;
+          ZHS.Log.warn('多页弹题部分页未答上，已交由人工处理');
+          if (ZHS.panel) {
+            ZHS.panel.alert('这题有多页，部分还没选上：请手动补全剩余页，弹窗保留等你作答', 'warn', 10000);
+          }
+        }
+        return;
+      }
+      this._answeredSig = sig || '';   // 标记已作答完成（全部页都已答上），后续轮次去重跳过
+      await this.closeDialogAndResume();
+    },
+
+    /**
+     * 处理「非标准 A/B 简单答题」弹窗（标准题面/选项一段都识别不到时的最后兜底）。
+     *
+     * 用户诉求（2026-09-19 原话）：「猜两次可以，问题是脚本没有在答这种题——它只是乱点；
+     * 如果你能检测出题目、能答出来，那就答对再关。」
+     * 因此本函数改成两段式，**先真求解，求不出来才猜**：
+     *
+     *   第一段（优先）：Dialog.readCurrent 读题干+选项 → Solver.solve（题库/LLM）
+     *                  → 按答案索引点击 → Filler.isChecked 自检选中态
+     *                  → 自检通过才作答成功计数 → 关闭弹窗。
+     *   第二段（兜底）：第一段任何一步失败（读不到题、求解返回 null、自检不过）
+     *                  都落到这里 —— 扫文本前缀找 A/B 选项，随机选一个点掉试关，
+     *                  失败再换另一个（最多 2 轮，「猜两次」），两轮都关不掉才放弃转人工。
+     *
+     * 为什么要自检：平台规则是「未作答的弹题不能关闭」，脚本若自以为答完了去硬关，
+     * 只会被平台拒绝，再陷入「关不掉 → 退避 → 再关」的死循环骚扰用户。
+     * 宁可明确转人工，也不假装答上了。
+     */
+    async _tryNonStandardAB(root, sig) {
+      ZHS.Log.info('识别到非标准 A/B 简单答题弹窗，先尝试真作答（题库/LLM），失败再猜 A/B');
+
+      // 读取选项：**必须用 Dialog.readOptions 独立读，不能复用 readCurrent().options**。
+      //
+      // 【P1 死代码修复 · 2026-09-19】进入本函数的条件是「readCurrent().options 为空」，
+      // 而旧代码第一段的入口条件却是「options.length >= 2」——两者**互斥**，
+      // 导致第一段（真求解作答）永远不执行，用户要的「能答就答对再关」形同虚设，
+      // 只剩乱猜（实测 Solver.solve 调用次数 = 0）。
+      // 根因是把「标准选择器读不到选项」错当成「这题没有选项」：
+      // 按钮式/div 式 A/B 题（选项是 button，没有 .el-radio）标准选择器读不到，
+      // 但它确实有选项、确实可作答。readOptions 提供更宽的独立通道，读不到再降级。
+      const ro = (ZHS.Questions.Dialog.readOptions && ZHS.Questions.Dialog.readOptions(root))
+        || { elements: [], texts: [] };
+      const optEls = ro.elements || [];
+      const optTexts = ro.texts || [];
+
+      // 题干兜底链：标准题面 → .el-dialog__title（弹窗标题）→ body 整段文本。
+      // 只要拿到任一非空题面就可以交给 Solver 去匹配，总好过完全不读题。
+      const q = ZHS.Questions.Dialog.readCurrent(root);
+      let title = q && q.title ? String(q.title).trim() : '';
+      if (!title) {
+        // 【P2 修复 · round-22】root 本身可能是 null（调用方未传/弹窗已消失），
+        // 必须先判 root 再判 root.querySelector —— 与上面 :282 readCurrent(root) 的容忍度一致
+        // （readCurrent 内部 `if (!r) return null` 不崩，这里若不判 root 就会 TypeError）。
+        const b = root && root.querySelector
+          && (root.querySelector('.el-dialog__title') || root.querySelector('.el-dialog__body'));
+        if (b) title = (U.normText(b.textContent || '') || '').trim();
+      }
+
+      // ===== 第一段：真求解（优先，能答对就答对再关） =====
+      // 入口条件与「进入本函数的原因」自洽：不再看 readCurrent().options，
+      // 而是看「独立读到的选项 >= 2」+「拿到题面」。
+      if (title && optTexts.length >= 2) {
+        try {
+          ZHS.Log.info('A/B 弹窗题干：' + title.slice(0, 60) + '（选项 ' + optTexts.length + ' 个）');
+          const result = await ZHS.Solver.solve({ title, options: optTexts, type: q ? q.type : 'unknown' });
+          if (result && result.answer) {
+            const idxs = ZHS.Bank.toIndexes(result.answer);
+            let answered = false;
+            for (const idx of idxs) {
+              const el = optEls[idx];
+              if (!el) continue;   // 索引越界守卫：取不到就跳过该索引，不崩
+              // Filler.clickOption：内含 .el-radio__input 内层点击 + input.checked 兜底 + 重试。
+              // 返回值的意义：完成「点击动作」并尽量确认选中态。
+              // eslint-disable-next-line no-await-in-loop
+              const clicked = await ZHS.Filler.clickOption(el);
+              // eslint-disable-next-line no-await-in-loop
+              await U.sleep(600);
+              // 判据只认 isChecked（自检真实选中态）——clicked 仅用于日志：
+              // `(clicked || isChecked) && isChecked` 在布尔代数上等价于 isChecked，clicked 被短路，
+              // 写成这样容易让读者误以为 clicked 也参与判定，故显式分开写。
+              const checked = ZHS.Filler.isChecked(el);
+              if (checked) {
+                answered = true;
+              } else {
+                ZHS.Log.debug('A/B 弹窗选项点击后未选中（clicked=' + clicked + '），尝试二次点击');
+                // 点完仍检不到选中态，再点一次（Element UI 的 label 偶发需要二次点击）
+                // eslint-disable-next-line no-await-in-loop
+                try { el.click(); } catch (e) { /* 忽略 */ }
+                // eslint-disable-next-line no-await-in-loop
+                await U.sleep(400);
+                if (ZHS.Filler.isChecked(el)) answered = true;
+              }
+            }
+            if (answered) {
+              // 防重复计数：同一个弹窗可能先被标准链路答过一次（_solveCurrentPage），
+              // 关闭失败后又落到这里再答一次；answeredCount 是给用户看「答了几道题」的，
+              // 同一弹窗计两次会让总结报告虚高。用签名去重，只计第一次。
+              if (sig !== this._countedSig) {
+                this._countedSig = sig || '';
+                ZHS.state.answeredCount++;
+              }
+              ZHS.Log.info('已作答（A/B 弹窗）：' + result.answer + '（来源 ' + result.from + '）');
+              const ok = await this.closeDialogAndResume();
+              if (ok) {
+                this._answeredSig = sig || '';
+                return;
+              }
+              ZHS.Log.warn('A/B 弹窗已作答但关闭失败，转入随机猜的兜底流程');
+            } else {
+              ZHS.Log.warn('A/B 弹窗答案已求出（' + result.answer + '）但点击未生效，不硬关，转入随机猜');
+            }
+          } else {
+            ZHS.Log.info('A/B 弹窗无可用答题通道（题库查不到且未配置 LLM Key），转入随机猜');
+          }
+        } catch (e) {
+          ZHS.Log.warn('A/B 弹窗真作答异常（' + (e && e.message) + '），转入随机猜');
+        }
+      } else {
+        ZHS.Log.debug('A/B 弹窗题干或选项读不到（题面「' + title.slice(0, 30)
+          + '」/ 选项 ' + optTexts.length + ' 个），跳过真作答，直接随机猜');
+      }
+
+      // ===== 第二段：无通道兜底 —— 逐个试选项，确认选中/作答后才关（round-37） =====
+      // 用户诉求（原话）：「如果没有密钥答不出来，则随机选择 ABCD 答案都来一次，然后等待一会再关闭；
+      // 没答完不能采取关闭」。所以这里：随机把选项逐个点一次（每步代码等待），用 isChecked 自检
+      // 真实选中态；只有确认选中后才等待+关闭；逐个都选不上时遵守「没答完不关」，转人工，
+      // 绝不硬关（硬关只会被平台拒绝 → 关不掉死循环骚扰）。
+      const optSel = '.el-radio, .el-checkbox, [role="radio"], [role="option"],'
+        + ' .option-item, .choice-item, .answer-option, .option-btn, .option, .choice, .item-topic';
+      const allOpts = optEls.length >= 2 ? optEls : Array.from(root.querySelectorAll(optSel));
+      let opts = allOpts.filter((el) => {
+        const t = (el.textContent || '').replace(/\s+/g, '').toLowerCase();
+        return /^([abcd][.、:：]?|是|否|对|错|正确|错误|√|×)/.test(t);
+      });
+      if (!opts.length) opts = allOpts.slice(0, 4);   // 退一步：取前若干选项元素
+      if (!opts.length) {
+        if (this._giveUpSigs) this._giveUpSigs.add(sig);
+        this._pendingHuman = true;
+        if (ZHS.panel) ZHS.panel.alert('检测到要作答才能关的题，但自动找不到选项，请手动选一个', 'warn', 10000);
+        ZHS.Log.warn('A/B 兜底找不到选项元素，放弃自动处理，提示用户手动选');
+        return;
+      }
+
+      // ★ 2026-10-24 修正：瞎蒙受 gatedRandom 统一控制（与 11-solver 频道 D 一致）。
+      // 用户要求「各种情况不要瞎选答案、不瞎蒙」——无答案时不再默认随机猜，
+      // 而是遵守「没答完不关」转人工，把选择权交还用户（瞎蒙错答会拉分，且部分课程不可回退）。
+      // 只有显式开启 gatedRandom（逃生舱，保证流程不卡死）才保留随机猜。
+      if (!ZHS.config.gatedRandom) {
+        ZHS.Log.warn('无通道兜底：按配置不瞎蒙，放弃随机猜，转人工保留弹窗');
+        if (this._giveUpSigs) this._giveUpSigs.add(sig);
+        this._pendingHuman = true;
+        if (ZHS.panel) ZHS.panel.alert('本题本地推测也没有把握，按「不瞎蒙」已跳过随机作答；可在设置里开启「答不出时随机选（保进度）」，或手动选一个', 'warn', 12000);
+        this._resumePlay();
+        return;
+      }
+
+      // 随机打乱，逐个试（"ABCD 都来一次"，仅 gatedRandom 开启时）
+      const orderIdx = opts.map((_, i) => i);
+      for (let i = orderIdx.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); const tmp = orderIdx[i]; orderIdx[i] = orderIdx[j]; orderIdx[j] = tmp; }
+      let selected = false; let selectedIdx = -1;
+      for (let r = 0; r < orderIdx.length; r++) {
+        const oi = orderIdx[r];
+        const pick = opts[oi];
+        ZHS.Log.info('无通道兜底：试第 ' + (r + 1) + '/' + orderIdx.length + ' 个选项');
+        try { await ZHS.Filler.clickOption(pick); }
+        catch (e) { try { pick.click(); } catch (e2) { /* 忽略 */ } }
+        await U.sleep(700);   // 每步代码等待，等平台反应
+        if (ZHS.Filler.isChecked(pick)) { selected = true; selectedIdx = oi; ZHS.Log.info('选项 ' + (oi + 1) + ' 已确认选中'); break; }
+      }
+
+      if (!selected) {
+        // 逐个试完仍检测不到选中态（可能是需真实点击的控件 / 环境无法自检）——
+        // 严格遵守「没答完不能关」：不硬关，转人工，避免关不掉的死循环。
+        if (this._giveUpSigs) this._giveUpSigs.add(sig);
+        this._pendingHuman = true;
+        try { if (ZHS.Filler && ZHS.Filler.dumpDiag) ZHS.Filler.dumpDiag(root, opts); } catch (e) { /* 忽略 */ }
+        if (ZHS.panel) ZHS.panel.alert('这题要选中才能关，但自动点选没生效（可能是需真实点击的控件），请手动选一个', 'warn', 12000);
+        ZHS.Log.warn('无通道兜底逐个试选项均未确认选中，遵守「没答完不关」，转人工');
+        this._resumePlay();
+        return;
+      }
+
+      // 已确认选中 → 等待一会让平台登记作答，再关
+      await U.sleep(1200);
+      ZHS.Log.info('无通道兜底已选中选项 ' + (selectedIdx + 1) + '，等待后关闭弹窗');
+      const ok = await this.closeDialogAndResume({ noChannel: true });
+      if (ok) { this._answeredSig = sig || ''; ZHS.Log.info('无通道兜底选中后成功关闭，恢复播放'); return; }
+
+      // 选中了却关不掉 → 转人工
+      if (this._giveUpSigs) this._giveUpSigs.add(sig);
+      this._pendingHuman = true;
+      if (ZHS.panel) ZHS.panel.alert('已选中答案但弹窗仍关不掉，请手动点关闭', 'warn', 10000);
+      ZHS.Log.warn('无通道兜底已选中但关闭失败，转人工');
+      this._resumePlay();
+    },
+
+    /**
+     * round-37：确保「至少一个选项被真实选中」后才关闭（严格遵守「没答完不能关闭」）。
+     * 逐个尝试选项（优先已求解答案 prefer），每步代码等待 + isChecked 自检；
+     * 确认选中 → 等待一会让平台登记 → 关闭；逐个都选不中 → 转人工保留弹窗，绝不硬关。
+     * @returns {Promise<boolean>} 是否已选中并成功关闭
+     */
+    async _ensureAnsweredThenClose(root, sig, prefer) {
+      const Q = ZHS.Questions.Dialog;
+      let els = [];
+      try {
+        const ro = Q.readOptions && Q.readOptions(root);
+        if (ro && ro.elements && ro.elements.length >= 2) els = ro.elements.slice();
+      } catch (e) { /* 忽略 */ }
+      if (els.length < 2) {
+        try { const q = Q.readCurrent(root); if (q && q.elementList && q.elementList.length) els = q.elementList.slice(); } catch (e) { /* 忽略 */ }
+      }
+      if (els.length < 2) {
+        try {
+          els = Array.from(root.querySelectorAll('.el-radio, .el-checkbox, [role="radio"], [role="option"], .option, .choice, .option-item, .choice-item, .item-topic'));
+        } catch (e) { /* 忽略 */ }
+      }
+      if (els.length < 2) {
+        this._pendingHuman = true;
+        if (ZHS.panel) ZHS.panel.alert('这题要作答才能关，但自动找不到选项，请手动选一个', 'warn', 10000);
+        ZHS.Log.warn('_ensureAnsweredThenClose 找不到选项元素，转人工');
+        return false;
+      }
+
+      // 排序：优先已求解答案索引；其余选项仅在 gatedRandom 开启时才纳入尝试序列，
+      // 否则只试已求解答案——没有正确答案绝不瞎蒙，统一转人工（遵守「没答完不关」）。
+      const all = els.map((_, i) => i);
+      const pref = (prefer || []).filter((i) => i >= 0 && i < els.length);
+      const rest = ZHS.config.gatedRandom
+        ? all.filter((i) => pref.indexOf(i) < 0)
+        : [];
+      const seq = pref.concat(rest);
+
+      for (const i of seq) {
+        const el = els[i];
+        if (!el) continue;
+        ZHS.Log.info('确保作答：尝试选项 ' + (i + 1) + '/' + els.length);
+        try { await ZHS.Filler.clickOption(el); }
+        catch (e) { try { el.click(); } catch (e2) { /* 忽略 */ } }
+        await U.sleep(700);
+        if (ZHS.Filler.isChecked(el)) {
+          ZHS.Log.info('选项 ' + (i + 1) + ' 已确认选中，等待平台登记后关闭');
+          await U.sleep(1200);
+          const ok = await this.closeDialogAndResume({ noChannel: true });
+          if (ok) { this._answeredSig = sig || ''; return true; }
+          this._pendingHuman = true;
+          if (ZHS.panel) ZHS.panel.alert('已选中答案但弹窗仍关不掉，请手动点关闭', 'warn', 10000);
+          return false;
+        }
+      }
+
+      // 逐个都选不中 → 遵守「没答完不关」，转人工
+      this._pendingHuman = true;
+      try { if (ZHS.Filler && ZHS.Filler.dumpDiag) ZHS.Filler.dumpDiag(root, els); } catch (e) { /* 诊断失败不影响主流程 */ }
+      if (ZHS.panel) ZHS.panel.alert('这题要选中才能关，但自动点选没生效（可能是需真实点击的控件），请手动选一个', 'warn', 12000);
+      ZHS.Log.warn('逐个选项均未确认选中，遵守「没答完不关」，转人工');
+      this._resumePlay();
+      return false;
+    },
+
+    /**
+     * round-39b：当前 root（或页面）是否是 AI 助教随堂练习弹题（双变体）。
+     */
+    _isAiExercise(root) {
+      try {
+        if (root && root.matches && root.matches('.ai-test-question-wrapper, .ai-class-exercise-dialog')) return true;
+        const scope = (root && root.querySelector) ? root : document;
+        return !!scope.querySelector('.ai-test-question-wrapper, .ai-class-exercise-dialog');
+      } catch (e) { return false; }
+    },
+
+    /** round-39b：AI 弹窗盒子是否仍可见（含祖先链 inline 隐藏判定，Element UI 藏 wrapper） */
+    _aiBoxVisible(box) {
+      try {
+        if (!box || !document.contains(box)) return false;
+        let n = box;
+        while (n && n.style) {
+          if (n.style.display === 'none' || n.style.visibility === 'hidden') return false;
+          n = n.parentElement;
+        }
+        return U.isStructurallyVisible ? U.isStructurallyVisible(box) : true;
+      } catch (e) { return false; }
+    },
+
+    /**
+     * round-39b：AI 助教随堂练习弹题统一处理器（ocsjs 原厂 grounding）。
+     * 双变体：.ai-test-question-wrapper（选项 .options .option，提交 .submit-btn .submits，关 .close-box）；
+     *         .ai-class-exercise-dialog（选项 .ques-list .item .option / .option，提交 .el-dialog__footer .el-button，关 .header-icon）。
+     * 流程：选一项（内嵌答案→求解→第一个）→ 点提交 → 点关闭 → 以「弹窗是否消失」验收 → 恢复播放。
+     * 关键：**不依赖 isChecked**（AI 弹窗选中态常不可见），成功判据 = 弹窗关掉没。
+     */
+    async _handleAiExercise(root) {
+      const video = ZHS.Player && ZHS.Player.video();
+      if (video && !video.paused) { try { video.pause(); } catch (e) {} }
+      let box = null;
+      try {
+        box = (root && root.querySelector)
+          ? (root.querySelector('.ai-test-question-wrapper, .ai-class-exercise-dialog') || root)
+          : document.querySelector('.ai-test-question-wrapper, .ai-class-exercise-dialog');
+      } catch (e) { box = root || null; }
+      if (!box) return;
+
+      // 1) 选哪项：内嵌答案 > 求解(LLM/题库/启发式) > 第一个
+      let idx = 0;
+      try {
+        let ans = null;
+        try { ans = ZHS.Questions.Dialog.answerFromDom(); } catch (e) { ans = null; }
+        if (!ans) {
+          const q = ZHS.Questions.Dialog.readCurrent(box);
+          if (q && q.options && q.options.length) {
+            const r = await ZHS.Solver.solve({ title: q.title, options: q.options, type: q.type });
+            if (r && r.answer) ans = r.answer;
+          }
+        }
+        if (ans) { const ii = ZHS.Bank.toIndexes(ans); if (ii.length) idx = ii[0]; }
+      } catch (e) { /* 求解失败用第一个 */ }
+
+      // 2) 选项元素（双变体选择器优先，宽松回退）
+      let opts = Array.from(box.querySelectorAll('.options .option, .ques-list .item .option, .option'));
+      if (opts.length < 2) {
+        const more = Array.from(box.querySelectorAll('.option, [role="option"], .option-item, .choice-item'));
+        opts = opts.concat(more.filter((el) => opts.indexOf(el) < 0));
+      }
+      if (!opts.length) {
+        ZHS.Log.warn('AI 随堂练习没找到选项元素，转人工');
+        this._pendingHuman = true;
+        if (ZHS.panel) ZHS.panel.alert('AI 随堂练习没识别到选项，请手动选一个', 'warn', 8000);
+        return;
+      }
+      const pick = opts[Math.min(idx, opts.length - 1)] || opts[0];
+      try { pick.click(); } catch (e) {}
+      ZHS.Log.info('AI 随堂练习：已选第 ' + (opts.indexOf(pick) + 1) + '/' + opts.length + ' 项');
+      await U.sleep(800);
+
+      // 3) 提交（双变体 + 文本兜底）
+      let submit = null;
+      try {
+        submit = box.querySelector('.submit-btn .submits, .el-dialog__footer button.el-button, .el-dialog__footer .el-button.btn, .submit-btn, .btn.submit');
+      } catch (e) {}
+      if (!submit) {
+        try {
+          submit = Array.from(box.querySelectorAll('button, .el-button, .btn'))
+            .find((b) => /^(提交|确定|确认|提交答案)$/.test((b.textContent || '').replace(/\s+/g, ''))) || null;
+        } catch (e) {}
+      }
+      if (submit) { try { submit.click(); ZHS.Log.info('AI 随堂练习：已点提交'); } catch (e) {} }
+      await U.sleep(800);
+
+      // 4) 关闭（提交后仍在才关）
+      if (this._aiBoxVisible(box)) {
+        let closeBtn = null;
+        try {
+          closeBtn = box.querySelector('.close-box, .header-icon, .el-dialog__close, .close-btn')
+            || (box.closest('.el-dialog__wrapper') || box).querySelector('.close-box, .header-icon, .el-dialog__close, .close-btn');
+        } catch (e) {}
+        if (!closeBtn) {
+          try {
+            closeBtn = Array.from(box.querySelectorAll('button, .el-button, .btn, [class*="close"]'))
+              .find((b) => /^(关闭|我知道了)$/.test((b.textContent || '').replace(/\s+/g, ''))) || null;
+          } catch (e) {}
+        }
+        if (closeBtn) { try { closeBtn.click(); ZHS.Log.info('AI 随堂练习：已点关闭'); } catch (e) {} }
+        await U.sleep(600);
+      }
+
+      // 5) 验收（弹窗消失）+ 恢复
+      const gone = !this._aiBoxVisible(box);
+      ZHS.Log.info(gone ? 'AI 随堂练习已处理并关闭' : 'AI 随堂练习已提交（弹窗仍在，下轮再判）');
+      if (ZHS.Player) ZHS.Player.resetSync();
+      ZHS.state.dialogActive = false;
+      ZHS.state.dialogPhase = 'answered';
+      if (video && video.paused && !video.ended) {
+        // round-46：AI 弹窗处理完恢复播放，同样 resetHumanPause（与 _resumePlay 同理，
+        // 弹题干预 = 「模拟离座」计划作废，避免跨干预继续计时导致到期假播报）
+        if (ZHS.Player && ZHS.Player.resetHumanPause) ZHS.Player.resetHumanPause();
+        try { video.muted = true; const p = video.play(); if (p && p.catch) p.catch(() => {}); ZHS.Log.info('AI 随堂练习后已恢复播放'); } catch (e) {}
+      }
+    },
+
+    /** 找真实弹题容器（支持 top document / iframe document / 节点本身） */
+    _classicQuizBox(root) {
+      try {
+        if (!root) return null;
+        if (root.nodeType === 9) {                       // iframe 的 document
+          return root.querySelector('#playTopic-dialog, .dialog-test');
+        }
+        if (root.matches && root.matches('#playTopic-dialog, .dialog-test')) return root;
+        if (root.closest) {
+          const box = root.closest('#playTopic-dialog, .dialog-test');
+          if (box) return box;
+        }
+      } catch (e) { /* 忽略 */ }
+      return null;
+    },
+
+    _isVisible(el) {
+      try {
+        if (!el) return false;
+        const r = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
+        if (!r || (r.width === 0 && r.height === 0)) return false;
+        const cs = getComputedStyle(el);
+        return cs.display !== 'none' && cs.visibility !== 'hidden';
+      } catch (e) { return true; }
+    },
+
+    /**
+     * 多点几套事件：合成 click + 指针事件 + 直调 onclick + 拟人点击。
+     * 背景（用户实测 2026-10-26）：平台弹题对单一 el.click() 不响应，
+     * 脚本却继续推进视频 → 弹题未答、时长不上报。这里把能想到的通道都走一遍，
+     * 目标不是骗过 isTrusted，而是覆盖「绑在 pointerdown / onclick / click 上」的各种监听。
+     */
+    _fireClick(el) {
+      if (!el) return false;
+      try { if (el.scrollIntoView) el.scrollIntoView({ block: 'center', inline: 'nearest' }); } catch (e) { /* 忽略 */ }
+      let cx = 0, cy = 0;
+      try { const r = el.getBoundingClientRect(); cx = r.x + r.width / 2; cy = r.y + r.height / 2; } catch (e) { /* 忽略 */ }
+      const fire = (type, Ctor, extra) => {
+        try {
+          const opt = Object.assign({ bubbles: true, cancelable: true, view: window, clientX: cx, clientY: cy, button: 0 }, extra || {});
+          el.dispatchEvent(new Ctor(type, opt));
+        } catch (e) { /* 忽略 */ }
+      };
+      if (typeof PointerEvent === 'function') {
+        fire('pointerdown', PointerEvent, { buttons: 1, pointerId: 1, pointerType: 'mouse', isPrimary: true });
+        fire('pointerup', PointerEvent, { buttons: 0, pointerId: 1, pointerType: 'mouse', isPrimary: true });
+      }
+      fire('mouseover', MouseEvent, {});
+      fire('mousedown', MouseEvent, { buttons: 1 });
+      fire('mouseup', MouseEvent, { buttons: 0 });
+      fire('click', MouseEvent, {});
+      try { el.click(); } catch (e) { /* 忽略 */ }
+      try {
+        if (typeof el.onclick === 'function') {
+          el.onclick({ currentTarget: el, target: el, preventDefault() {}, stopPropagation() {} });
+        }
+      } catch (e) { /* 忽略 */ }
+      try { if (U.realClickHuman) U.realClickHuman(el); } catch (e) { /* 忽略 */ }
+      return true;
+    },
+
+    /**
+     * 真机知到课中弹题（#playTopic-dialog / .dialog-test，选项 .topic-item）。
+     *
+     * 为什么不再依赖标准链路：真机点选项不改选中态（class 恒为 topic-item），
+     * 标准链路 isChecked 自检必然失败 → 判「没答完不关」→ 弹窗一直挂着。
+     * 现在的流程（参考 OCS handleTestDialog + 本项目 SPA 直调思路）：
+     *   选一项（内嵌答案 > 求解 > 第一项）→ 等一拍 → 点关闭（多候选多事件）→ 验收弹窗消失；
+     *   连续 6 轮仍关不掉（平台可能忽略合成事件）→ 隐藏遮挡层并恢复播放，
+     *   绝不把「点不掉」当成「可以继续点下一节」。
+     */
+    _isClassicAiQuiz(root) {
+      try {
+        const box = this._classicQuizBox(root);
+        if (!box) return false;
+        return !!box.querySelector('.topic-item, .topic .radio ul > li, ul li');
+      } catch (e) {
+        return false;
+      }
+    },
+
+    async _handleClassicAiQuiz(root, sig) {
+      const Q = ZHS.Questions.Dialog;
+      const video = ZHS.Player && ZHS.Player.video();
+      if (video && !video.paused) { try { video.pause(); } catch (e) { /* 忽略 */ } }
+      ZHS.state.dialogActive = true;
+      ZHS.state.dialogPhase = 'answering';
+
+      // 1) 选哪一项：DOM 内嵌答案 > 求解器 > 第一项
+      let answer = null;
+      try { answer = Q.answerFromDom(); } catch (e) { answer = null; }
+      let q = null;
+      try {
+        const scope = (root && root.nodeType === 9) ? root : ((root && root.closest && root.closest('.el-dialog__wrapper')) || root);
+        q = Q.readCurrent(scope);
+      } catch (e) { q = null; }
+      if (!answer && q && q.options && q.options.length) {
+        try {
+          const r = await ZHS.Solver.solve({ title: q.title, options: q.options, type: q.type });
+          if (r && r.answer) answer = r.answer;
+        } catch (e) { /* 求解失败就选第一个 */ }
+      }
+      let idx = 0;
+      if (answer) {
+        try { const ii = ZHS.Bank.toIndexes(answer); if (ii.length) idx = ii[0]; } catch (e) { /* 忽略 */ }
+      }
+
+      const OPT_SELS = [
+        '#playTopic-dialog .topic .radio ul > li',
+        '.dialog-test .topic .radio ul > li',
+        '#playTopic-dialog .topic-item',
+        '.dialog-test .topic-item',
+        '#playTopic-dialog ul li',
+      ];
+      const CLOSE_SELS = [
+        '#playTopic-dialog .close-btn', '.dialog-test .close-btn',
+        '#playTopic-dialog .btn', '.dialog-test .btn',
+        '#playTopic-dialog .el-dialog__headerbtn', '.dialog-test .el-dialog__headerbtn',
+        '#playTopic-dialog .el-dialog__close', '.dialog-test .el-dialog__close',
+      ];
+
+      const pickOption = (box) => {
+        for (const sel of OPT_SELS) {
+          let opts = [];
+          try { opts = Array.from(box.querySelectorAll(sel)); } catch (e) { opts = []; }
+          opts = opts.filter((el) => this._isVisible(el));
+          if (opts.length) {
+            const i = Math.min(idx, opts.length - 1);
+            this._fireClick(opts[i]);
+            return { total: opts.length, index: i };
+          }
+        }
+        return null;
+      };
+      const closeOnce = (box) => {
+        for (const sel of CLOSE_SELS) {
+          let btn = null;
+          try { btn = box.querySelector(sel); } catch (e) { btn = null; }
+          if (btn && this._isVisible(btn)) { this._fireClick(btn); return sel; }
+        }
+        try {
+          const cands = Array.from(box.querySelectorAll('button, .btn, a, span, div')).filter((el) => {
+            const t = (el.textContent || '').replace(/\s+/g, '');
+            return (t === '关闭' || t === '我知道了') && this._isVisible(el);
+          });
+          if (cands.length) { this._fireClick(cands[0]); return 'text-close'; }
+        } catch (e) { /* 忽略 */ }
+        return null;
+      };
+
+      let gone = false;
+      let lastBox = null;
+      // 同一道题若上一轮已判定「合成点击不被接受」并隐藏过，本轮不再反复试 6 次，
+      // 直接快速隐藏，避免每 15 秒就重复点击一轮（那反而更像机器）。
+      this._hardHidden = this._hardHidden || new Set();
+      const hardSig = sig || '';
+      const hardHidden = !!(hardSig && this._hardHidden.has(hardSig));
+      const maxAttempts = hardHidden ? 1 : 6;
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        let box = null;
+        try { box = this._classicQuizBox(Q.root()); } catch (e) { box = null; }
+        if (!box && root) box = this._classicQuizBox(root);
+        if (!box || !this._isVisible(box)) { gone = true; break; }
+        lastBox = box;
+
+        // 分页：逐页点过去，每页都选一项
+        let pages = [];
+        try { pages = Array.from(box.querySelectorAll('.el-pager .number')); } catch (e) { pages = []; }
+        const targets = pages.length ? pages : [null];
+        for (const p of targets) {
+          try { if (p && !p.classList.contains('active')) { this._fireClick(p); await U.sleep(500); } } catch (e) { /* 忽略 */ }
+          const chosen = pickOption(box);
+          if (chosen) {
+            let qt = '';
+            try {
+              const scope = box.closest('.el-dialog__wrapper') || box;
+              qt = (Q.readCurrent(scope) || {}).title || '';
+            } catch (e) { /* 忽略 */ }
+            ZHS.Log.info('课中弹题：选择第 ' + (chosen.index + 1) + '/' + chosen.total + ' 项'
+              + (answer ? '（答案 ' + answer + '）' : '（未取到答案，按巩固题处理）')
+              + (qt ? '｜' + String(qt).slice(0, 28) : ''));
+            await U.sleep(700);
+          }
+        }
+
+        const used = closeOnce(box);
+        await U.sleep(600);
+        try {
+          const b2 = this._classicQuizBox(Q.root());
+          gone = !b2 || !this._isVisible(b2);
+        } catch (e) { gone = false; }
+        if (gone) break;
+        ZHS.Log.warn('课中弹题关闭未生效（第 ' + attempt + '/' + maxAttempts + ' 次'
+          + (used ? '，已点 ' + used : '') + '），继续重试');
+        await U.sleep(600);
+      }
+
+      // 2) 兜底：平台忽略合成点击时，至少把遮挡层收掉，让视频和时长记录恢复，
+      //    并把弹题 DOM 打到控制台，方便下一次按真实结构适配（不把用户卡死在这里）。
+      if (!gone && lastBox) {
+        try {
+          const wrap = lastBox.closest ? (lastBox.closest('.el-dialog__wrapper') || lastBox) : lastBox;
+          const html = wrap && wrap.outerHTML ? wrap.outerHTML.slice(0, 1500) : '';
+          ZHS.Log.warn('[弹题取证] 点击未被平台接受，已隐藏遮挡层；弹题 DOM 片段：' + html);
+        } catch (e) { /* 忽略 */ }
+        try {
+          const hide = (el) => { if (el && el.style) el.style.display = 'none'; };
+          hide(lastBox);
+          const wrap = lastBox.closest ? lastBox.closest('.el-dialog__wrapper') : null;
+          hide(wrap);
+          document.querySelectorAll('.v-modal, .el-loading-mask, .mask').forEach((m) => hide(m));
+          if (hardSig) this._hardHidden.add(hardSig);
+          gone = true;
+          ZHS.Log.warn('弹题 DOM 已隐藏（平台可能仍记为未作答），先恢复播放避免时长中断');
+        } catch (e) { /* 忽略 */ }
+      }
+
+      if (gone) {
+        this._answeredSig = sig || '';
+        this._pendingHuman = false;
+        this._cooldownUntil = 0;
+        this._failCount = 0;
+        ZHS.Log.info('课中弹题已处理，恢复播放');
+      } else {
+        this._cooldownUntil = Date.now() + 15000;
+        ZHS.Log.warn('课中弹题仍未处理，暂不推进，等待下一轮');
+      }
+      ZHS.state.dialogActive = false;
+      ZHS.state.dialogPhase = gone ? 'answered' : 'pending-human';
+      if (ZHS.Player && ZHS.Player.resetSync) ZHS.Player.resetSync();
+      await this._resumePlay();
+    },
+
+    /**
+     * round-39（ocsjs 原厂 grounding）：点 AI 助教弹窗的「提交/确定」按钮（若存在）。
+     * 仅当页面上存在 AI 弹窗（.ai-test-question-wrapper / .ai-class-exercise-dialog）时才动，
+     * 且限定在该弹窗作用域内点击——经典 #playTopic-dialog 选完直接关（ocsjs 即如此），不提交。
+     * 原厂选择器：StudyPlusH5=.submit-btn .submits；WishdomH5=.el-dialog__footer .el-button.btn。
+     */
+    async _clickSubmitIfAny() {
+      let box = null;
+      try { box = document.querySelector('.ai-test-question-wrapper, .ai-class-exercise-dialog'); } catch (e) { return false; }
+      if (!box) return false;
+      const vis = (b) => { try { return b.offsetParent !== null || b.offsetWidth > 0; } catch (e) { return true; } };
+      const SELS = ['.submit-btn .submits', '.el-dialog__footer .el-button.btn', '.submit-btn', '.btn.submit', '.confirm-btn', '.submit'];
+      for (const s of SELS) {
+        try {
+          const btn = box.querySelector(s);
+          if (btn && vis(btn)) { btn.click(); await U.sleep(500); ZHS.Log.info('已点击提交按钮：' + s); return true; }
+        } catch (e) { /* 忽略 */ }
+      }
+      // 文本兜底（限定在 AI 弹窗内，且不含"下一题/关闭"，避免误推进）
+      try {
+        const txt = (el) => U.normText(el.innerText !== undefined && el.innerText !== null ? el.innerText : el.textContent);
+        const byText = Array.from(box.querySelectorAll('button, .el-button, .btn, [class*="submit"], [class*="confirm"], [class*="sure"]'))
+          .filter((b) => /^(提交|确定|确认|提交答案)$/.test(txt(b)) && vis(b));
+        if (byText.length) { byText[byText.length - 1].click(); await U.sleep(500); ZHS.Log.info('已点击提交按钮（文本匹配）'); return true; }
+      } catch (e) { /* 忽略 */ }
+      return false;
+    },
+
+    /**
+     * 关闭弹题并恢复播放（N4 需求）
+     * 策略：点关闭 → 校验是否真关了 → 没关就重试（最多 3 次，每次间隔递增）
+     */
+    async closeDialogAndResume(opts) {
+      const noChannel = !!(opts && opts.noChannel);
+      // round-39（ocsjs 原厂实现）：AI 助教弹窗流程是「选完选项 → 先点提交 → 再关」。
+      // 漏了提交，平台会以「未提交答案」拒绝关闭 → 关不掉死循环（这正是用户实测的根因之一）。
+      await this._clickSubmitIfAny();
+      // round-50：给出时间 —— 答完题后平台需要一点时间登记作答，太早点 X 关闭
+      // 会被平台以「未作答」拒绝（关不掉又回到死循环）。提交（若有）后先 settle 再关，
+      // 对应用户在听课页要求的「给出时间 → 点击 X → 继续听课」顺序。
+      await U.sleep(400);
+      const Q = ZHS.Questions.Dialog;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        const ok = Q.close();
+        await U.sleep(700 * attempt);
+
+        if (!Q.stillPresent()) {
+          ZHS.Log.info('弹题已关闭' + (attempt > 1 ? '（第 ' + attempt + ' 次尝试）' : ''));
+          this._failCount = 0;
+          this._cooldownUntil = 0;
+          this._pendingHuman = false;
+          this._resumePlay();
+          return true;
+        }
+        ZHS.Log.warn('弹题关闭失败，重试第 ' + attempt + ' 次');
+      }
+
+      this._failCount++;
+      // 无通道场景：不转人工卡死主循环，交由调用方（_answerDialog）恢复播放并继续重试。
+      if (noChannel) return false;
+
+      // 有通道场景（明确需要人工）：平台大概率是因为「未作答」拒绝关闭，
+      // 退避 30s 防反复骚扰，明确告知用户手动作答，脚本安静等待，弹窗消失后自动复位。
+      this._cooldownUntil = Date.now() + 30 * 1000;   // 退避 30s，防关不掉的弹窗反复骚扰
+      this._pendingHuman = true;
+      ZHS.Log.warn('弹题自动关闭失败（累计 ' + this._failCount + ' 次），已转人工：请手动作答或关闭弹窗');
+      if (ZHS.panel) {
+        ZHS.panel.alert('弹窗关不掉？多半是还没作答——请手动选好答案，脚本会继续等你', 'warn', 10000);
+      }
+      return false;
+    },
+
+    /** 无通道时跳过弹题的节流告警：每 30s 最多提示一次，避免刷屏 */
+    _throttledSkipWarn(sig) {
+      const now = Date.now();
+      if (this._lastSkipWarnAt && now - this._lastSkipWarnAt < 30000) return;
+      this._lastSkipWarnAt = now;
+      if (!this._skippedSigs) this._skippedSigs = new Set();
+      if (sig) this._skippedSigs.add(sig);
+      ZHS.Log.warn('本题没找到可用答案，平台又不许关闭未作答弹题，已尝试跳过并继续播放；可在设置里开启「答不出时随机选（保进度）」');
+      if (ZHS.panel) {
+        ZHS.panel.alert('本题没找到可用答案，已尝试跳过并继续播放；如需强制选一个，请在设置里开启「答不出时随机选（保进度）」', 'warn', 10000);
+      }
+    },
+
+    /**
+     * 恢复播放（弹题处理完后）—— round-50 强化为「检测 → 播放 → 复检 → 没播就再点」闭环。
+     *
+     * 旧实现只做 `if (v.paused) v.play()` 且 play() 的 reject 被静默吞掉，
+     * 视频没真播起来却被记成「已恢复播放」，表现就是用户报的「答完题、关掉弹窗，
+     * 视频不接着放」。现改为严格顺序：
+     *   ① resetHumanPause（弹题 = 切课级干预，幽灵态清掉，避免 ensurePlaying 被挡）
+     *   ② 静音 + 倍速（平台会重置 muted，先静音绕过自动播放策略）
+     *   ③ 给出时间：弹窗刚关，播放器 UI 与 video 状态需短暂同步，先 settle
+     *   ④ 检测在不在播放：尝试「点真实播放按钮 + 裸 video.play() 兜底」，等一下再读 v.paused 复检
+     *   ⑤ 没真播起来 → 按用户要求「再次选择播放」并复检，最多重试 3 次
+     *   ⑥ 只有确认 !v.paused 才记「已恢复播放」；多次仍不行则交主循环 ensurePlaying 保活，不假报。
+     */
+    async _resumePlay() {
+      try {
+        if (ZHS.Player && ZHS.Player.resetHumanPause) ZHS.Player.resetHumanPause();
+        const v = ZHS.Player && ZHS.Player.video();
+        if (!v) return;
+        const cfg = ZHS.config;
+        if (cfg.mute) ZHS.Player.mute(v);
+        ZHS.Player.setSpeed(v, cfg.speed);
+        if (v.ended) { ZHS.Log.debug('弹题关闭后视频已结束，跳过恢复播放'); return; }
+
+        // ③ 给出时间：弹窗刚关闭，播放器 UI 与 video 状态需要一点时间同步。
+        //    立刻读 v.paused / 调 play() 可能仍停在弹题暂停态，或播放器内部状态拦截 play()。
+        const tryResumeOnce = async () => {
+          if (!v.paused) return true;                  // 已在播，无需动作
+          // 先点真实播放按钮（自定义播放器常忽略裸 video.play()）
+          if (ZHS.Player && ZHS.Player.clickPlayButton) ZHS.Player.clickPlayButton(v);
+          // 再补一次裸 video.play() 兜底（已静音，绕过自动播放策略）
+          if (v.paused) {
+            const p = v.play();
+            if (p && typeof p.catch === 'function') {
+              try { await p; } catch (e) { ZHS.Log.debug('video.play() 被拒绝：' + e.message); }
+            }
+          }
+          await U.sleep(700);
+          return !v.paused;                            // ④ 复检：真的播起来才算
+        };
+
+        // ③ 先 settle，让播放器 UI 同步
+        await U.sleep(300);
+
+        // 第一轮
+        if (await tryResumeOnce()) { ZHS.Log.info('弹题关闭后已恢复播放'); return; }
+
+        // ⑤ 没真播起来 → 按用户要求「再次选择播放」并复检，最多重试 3 次
+        for (let i = 1; i <= 3; i++) {
+          ZHS.Log.warn('弹题关闭后视频未真正播放（第 ' + i + ' 次重试），再次点击播放');
+          if (await tryResumeOnce()) { ZHS.Log.info('弹题关闭后经重试已恢复播放'); return; }
+        }
+        // ⑥ 多次仍不行：不假报「已恢复」，交主循环 ensurePlaying 保活（每 2 秒一轮）
+        ZHS.Log.warn('弹题关闭后多次尝试仍未能恢复播放，交由主循环保活');
+      } catch (e) {
+        ZHS.Log.debug('恢复播放异常：' + e.message);
+      }
+    },
+
+    /**
+     * 求解并作答当前分页
+     * @returns {boolean} 是否**实际作答成功**（选项真的被选中，经 isChecked 自检）
+     */
+    async _solveCurrentPage(root) {
+      const q = ZHS.Questions.Dialog.readCurrent(root);
+      if (!q || !q.options.length) {
+        ZHS.Log.debug('当前分页无选项，跳过');
+        return false;
+      }
+
+      ZHS.Log.info('弹题：' + (q.title || '(无题干)').slice(0, 60) + ' 选项 ' + q.options.length + ' 个');
+
+      const result = await ZHS.Solver.solve({
+        title: q.title,
+        options: q.options,
+        type: q.type,
+      });
+      if (!result) { this._noChannelThisRound = true; return false; }
+
+      let answered = false;
+      // 弹题的选项按钮在 .topic .radio ul > li，按索引点击
+      const idxs = ZHS.Bank.toIndexes(result.answer);
+      this._lastSolvedIdxs = idxs.slice();   // round-37：记下求解答案索引，未选中时供逐个重试
+      if (idxs.length) {
+        for (const idx of idxs) {
+          const flex = q.elementList[idx] ||
+            root.querySelector('.topic .radio ul > li:nth-child(' + (idx + 1) + ')');
+          if (flex) {
+            // 改走 Filler.clickOption（round-37 已强化为多子目标 × 多点击方式 + 选中自检）。
+            await ZHS.Filler.clickOption(flex);
+            await U.sleep(600);
+            // 自检：点击后确认选项真的处于选中态。没选中就再点一次整元素兜底
+            if (!ZHS.Filler.isChecked(flex)) {
+              try { flex.click(); } catch (e) { /* 忽略 */ }
+              await U.sleep(500);
+            }
+            if (ZHS.Filler.isChecked(flex)) {
+              answered = true;
+              ZHS.state.answeredCount++;
+              ZHS.Log.info('已作答：' + result.answer + '（来源 ' + result.from + '）');
+            } else {
+              // round-37：不再自欺「按默认视为已作答」。本题标记为未答上，
+              // 由上层按「没答完不能关闭」逐个重试选项，确认选中后才关。
+              this._noSelfCheck = true;
+              ZHS.Log.warn('选项点击后仍未确认选中（本题记未答上，后续按「没答完不关」逐个重试）');
+            }
+          }
+        }
+      } else if (q.type === 'completion' || q.type === 'qa' || q.type === 'judgement') {
+        const ok = await ZHS.Filler.fill(
+          { type: q.type, elementList: q.elementList, node: root },
+          result
+        );
+        if (ok.ok) {
+          answered = true;
+          ZHS.state.answeredCount++;
+          ZHS.Log.info('已作答（文本）：' + result.answer);
+        }
+      }
+      return answered;
+    },
+
+    /**
+     * 作业/考试页处理
+     * @param opts.manual 手动触发：绕过 autoAnswer / answerHomework 配置
+     */
+    async handleHomework(opts) {
+      const manual = !!(opts && opts.manual);
+      if (!manual && (!ZHS.config.autoAnswer || !ZHS.config.answerHomework)) return;
+      if (this._running) return;
+
+      const scene = ZHS.Questions.scene();
+      if (scene !== 'homework' && scene !== 'hike') return;
+
+      const list = ZHS.Questions.collect();
+      if (!list.length) return;
+
+      const unanswered = list.filter((q) => !this._isAnswered(q));
+      if (!unanswered.length) {
+        ZHS.Log.info('作业页所有题目都已作答');
+        return;
+      }
+
+      this._running = true;
+      try {
+        ZHS.Log.info('作业页共 ' + list.length + ' 题，待答 ' + unanswered.length + ' 题');
+        for (const q of unanswered) {
+          // eslint-disable-next-line no-await-in-loop
+          const result = await ZHS.Solver.solve(q);
+          if (!result) continue;
+          // eslint-disable-next-line no-await-in-loop
+          const filled = await ZHS.Filler.fill(q, result);
+          if (filled.ok) {
+            ZHS.state.answeredCount++;
+            ZHS.Log.info('第 ' + (q.index + 1) + ' 题已作答：' + result.answer + '（' + result.from + '）');
+          } else {
+            ZHS.Log.warn('第 ' + (q.index + 1) + ' 题回填失败');
+          }
+          const d = Number(ZHS.config.answerDelay) || 0;
+          // eslint-disable-next-line no-await-in-loop
+          if (d > 0) await U.sleep(d * 1000);
+        }
+        ZHS.Log.info('作业页作答完成');
+      } finally {
+        this._running = false;
+      }
+    },
+
+    /** 判断题目是否已作答 */
+    _isAnswered(q) {
+      const list = q.elementList || [];
+      if (!list.length) {
+        // 填空题：看输入框有没有值
+        const node = q.node || document;
+        const ta = node.querySelector && node.querySelector('textarea, input[type="text"]');
+        return !!(ta && ta.value && ta.value.trim());
+      }
+      return list.some((el) => ZHS.Filler.isChecked(el));
+    },
+
+    /** 重置弹题签名（切课后调用） */
+    reset() {
+      this._answeredSig = '';
+      this._noSelfCheckSig = '';
+      this._noSelfCheckUntil = 0;
+      this._skippedSigs = new Set();
+      this._lastSkipWarnAt = 0;
+      this._failCount = 0;
+      this._cooldownUntil = 0;
+      this._pendingHuman = false;
+      this._giveUpSigs = new Set();   // round-13：已放弃的非标准弹窗签名集合
+      this._countedSig = '';          // round-17：切课后重开计数闸门，新弹题可正常计数
+    },
+  };
+
+  ZHS.Answerer = Answerer;
+})();
+
+/* ===== 14-stats.js ===== */
+/**
+ * 统计层：答题记录 + 学习时长（M8）
+ *
+ * 目标：让面板能回答两个用户真正会问的问题——
+ *   ① 「今天答了几道题？答案都是哪来的（题库 / 模型）？」
+ *   ② 「今天学了多久？习惯分进度到哪了？」
+ *
+ * 设计取舍：
+ *  - 只存**明细最近 N 条 + 按天聚合**，不无限增长，避免 localStorage 被撑爆
+ *    （油猴脚本跑几个月不清理是很常见的，膨胀会拖慢整站）。
+ *  - 所有写入都吞异常：统计是锦上添花，**绝不能因为统计失败影响答题主流程**。
+ */
+(function () {
+  'use strict';
+  const ZHS = window.ZHS;
+  if (!ZHS || !ZHS.Util) return;
+  // 重入守卫：SPA 二次注入时整个模块直接退出，避免定时器/监听器叠加
+  if (ZHS.__mod14_stats) return;
+  ZHS.__mod14_stats = true;
+
+  const KEY = 'zhs_helper_stats';
+  const DAY_MS = 86400000;
+  // 明细上限：超过就丢最早的。200 条足够回看近期作答，又不至于撑爆存储。
+  const MAX_RECORDS = 200;
+  // 平台规则：每天学满 30 分钟得 1 分习惯分（README 4.4 节实测结论）
+  const HABIT_MINUTE = 30 * 60 * 1000;
+
+  function dayKey(ts) {
+    const d = new Date(ts || Date.now());
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return d.getFullYear() + '-' + m + '-' + day;
+  }
+
+  function load() {
+    try {
+      const raw = localStorage.getItem(KEY);
+      const d = raw ? JSON.parse(raw) : null;
+      return (d && typeof d === 'object') ? d : {};
+    } catch (e) {
+      return {};   // 存储损坏/被禁用时当作空数据，绝不让统计拖垮主流程
+    }
+  }
+
+  function save(d) {
+    try { localStorage.setItem(KEY, JSON.stringify(d)); } catch (e) { /* 配额满/隐私模式：静默放弃 */ }
+  }
+
+  const Stats = {
+    _data: null,
+
+    _ensure() {
+      if (!this._data) {
+        this._data = load();
+        if (!this._data.days) this._data.days = {};
+        if (!Array.isArray(this._data.records)) this._data.records = [];
+      }
+      return this._data;
+    },
+
+    _day(ts) {
+      const d = this._ensure();
+      const k = dayKey(ts);
+      if (!d.days[k]) d.days[k] = { answered: 0, bank: 0, llm: 0, skipped: 0, studyMs: 0 };
+      return d.days[k];
+    },
+
+    /**
+     * 记录一次作答。
+     * @param {string} title  题干（只存前 60 字，长题干没意义且占空间）
+     * @param {object} result solve() 的返回：{answer, from, confidence}
+     */
+    record(title, result) {
+      try {
+        const d = this._ensure();
+        const day = this._day(Date.now());
+        const from = (result && result.from) || '';
+
+        if (result && result.answer) {
+          day.answered++;
+          if (from.indexOf('bank') === 0) day.bank++;
+          else if (from === 'llm') day.llm++;
+        } else {
+          day.skipped++;
+        }
+
+        d.records.push({
+          t: Date.now(),
+          q: String(title || '').slice(0, 60),
+          a: (result && result.answer) || '',
+          from: from,
+        });
+        if (d.records.length > MAX_RECORDS) d.records.splice(0, d.records.length - MAX_RECORDS);
+
+        save(d);
+      } catch (e) { /* 统计失败不影响答题 */ }
+    },
+
+    /** 累加学习时长（毫秒） */
+    addStudyTime(ms) {
+      try {
+        const n = Number(ms) || 0;
+        if (n <= 0) return;
+        this._day(Date.now()).studyMs += n;
+        save(this._ensure());
+      } catch (e) { /* 同上 */ }
+    },
+
+    /** 今日概要 */
+    summary() {
+      try {
+        const d = this._ensure();
+        const today = d.days[dayKey(Date.now())] || { answered: 0, bank: 0, llm: 0, skipped: 0, studyMs: 0 };
+        let totalAnswered = 0;
+        let activeDays = 0;
+        for (const k of Object.keys(d.days)) {
+          const v = d.days[k];
+          totalAnswered += (v.answered || 0);
+          if ((v.answered || 0) > 0 || (v.studyMs || 0) > 0) activeDays++;
+        }
+        return {
+          today,
+          todayHabitDone: Math.floor((today.studyMs || 0) / HABIT_MINUTE),
+          todayHabitRemainMs: HABIT_MINUTE - ((today.studyMs || 0) % HABIT_MINUTE),
+          totalAnswered,
+          activeDays,
+          recent: (d.records || []).slice(-10).reverse(),
+        };
+      } catch (e) {
+        return { today: { answered: 0, bank: 0, llm: 0, skipped: 0, studyMs: 0 }, todayHabitDone: 0, todayHabitRemainMs: HABIT_MINUTE, totalAnswered: 0, activeDays: 0, recent: [] };
+      }
+    },
+
+    /** 清空统计（面板「清空记录」用） */
+    reset() {
+      this._data = { days: {}, records: [] };
+      save(this._data);
+    },
+
+    /** 供测试与调试：不持久化地直接读取 */
+    _dayKey: dayKey,
+  };
+
+  ZHS.Stats = Stats;
+})();
+
+})();
